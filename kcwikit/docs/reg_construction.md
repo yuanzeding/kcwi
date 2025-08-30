@@ -1,6 +1,6 @@
 # Region File Creation
 ## A guide for making regions files for the KCWI DRP.
-### Last updated: 9/19/2022
+### Last updated: 8/29/2025
 
 For some quick examples see `mizar:/scr/kbss-kcwi/tier1drp/kcwi_jul21/2021jul05/redux`
 
@@ -33,6 +33,10 @@ Save in **Physical** coordinates (that's all you have at this point!).
 The recently constructed datacubes are flattened to form a whitelight image and continuum objects are masked for median filtering.
 
 For standard stars and science targets, draw regions (ellipses) around continuum objects and save in **Physical** coordinates.
+
+For red channel data, if you are doing 3*300s exposures at the same position, there is apparently no need to manually draw duplicated regions. The latest version of kcwi_makemask_medfilter can read in an exposure grouping file and use automatically the regions from the first exposure in the same exposure sequence. You can make use of the json dictionary generated earlier for CR rejection. Example:
+
+ - kcwi_makemask_medfilter -r -f ../kcwi_2025aug27_red.json
 
 **Sample command:**
   - `for i in {50..55}; do ds9 kb210705_000${i}_icube.thum.fits -regions save kb210705_000${i}_icube.thum.reg -height 1200 -width 800 -zscale -mode region -regions shape ellipse -zoom to fit &; done`

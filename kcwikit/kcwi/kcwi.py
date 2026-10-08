@@ -580,7 +580,9 @@ def kcwi_vachelio(hdl, hdr_ref=None, mask=False, method='barycentric'):
     #resample
     for i_ext, hdu_in in enumerate(hdl_in):
         skipflag=False
-        cube_old = np.nan_to_num(hdu_in.data)
+        #cube_old = np.nan_to_num(hdu_in.data)
+        cube_old = np.nan_to_num(hdu_in.data,posinf=0.,neginf=0.)
+
         shape_new = (hdr_new['NAXIS3'], hdr_new['NAXIS2'], hdr_new['NAXIS1'])
         # Treat as science?
         if inputflag=='hdu':
@@ -622,6 +624,10 @@ def kcwi_vachelio(hdl, hdr_ref=None, mask=False, method='barycentric'):
                 if mask_flag==False:
                     f_cubic=interpolate.interp1d(wave_hel,spec,kind='cubic',fill_value=fill_value,bounds_error=False)
                     spec_new=f_cubic(wave_new)
+                    #if i==18 and j==47:
+                    #    print("Using cubic interpolation for science data.")
+                    #    plt.plot(wave_hel,hdu_in.data[:, j, i],drawstyle='steps-mid')
+                    #    plt.show()
                     # testing
                     #if (spec_new.shape[0]-np.sum(np.isfinite(spec_new)))>0:
                         #pdb.set_trace()
@@ -2015,17 +2021,20 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
         hdr['NAXIS']=2
 
         # mask?
-        regfn1 = fn[i].replace('_zap_new_icubes.fits','_rm.reg')
-        regfn2 = fn[i].replace('_new_icubes.fits','_rm.reg')
+        regfn1 = fn[i].replace('.fits','_rm.reg')
+        regfn2 = fn[i].replace('.fits','_rm.reg')
         if "zap" in fn[i]:
             regfn = regfn1
         else:
             regfn = regfn2
+        print("Checking for region file: {}".format(regfn))
         if os.path.isfile(regfn) and use_regmask==True and ".reg" in regfn:
             print('Using region mask: {}'.format(regfn))
             region = pyregion.open(regfn).as_imagecoord(hdr)
             tmp = np.mean(img,axis=2)
+            #print(img.shape, tmp.shape)
             mask_reg = region.get_mask(hdu=fits.PrimaryHDU(tmp.T,header=hdr))
+            #plt.imshow(mask_reg, origin='lower', cmap='gray')
             img[mask_reg.T!=0]=np.nan
 
         thum=np.zeros((sz[0],sz[1]))
@@ -2063,6 +2072,7 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
         thum[:xrange[0],:]=np.nan
         thum[xrange[1]:,:]=np.nan
         #thum=np.nan_to_num(thum)
+        thum[thum == 0] = np.nan
 
         # preshift
         if preshiftfn!='':
@@ -2107,6 +2117,7 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
 
                 # +/- 10 pixels
                 crls_size=search_size+conv_filter
+                #print(search_size,crls_size)
                 xx=np.linspace(-crls_size,crls_size,2*crls_size+1)
                 yy=np.linspace(-crls_size,crls_size,2*crls_size+1)
                 dy,dx=np.meshgrid(yy,xx)
@@ -2117,6 +2128,8 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                     for jj in range(crls.shape[1]):
                         cut0=img0[box[0]:box[1],box[2]:box[3]]
                         cut=img[box[0]-dx[ii,jj]:box[1]-dx[ii,jj],box[2]-dy[ii,jj]:box[3]-dy[ii,jj]]
+                        #print(cut)
+                        #print(box[0]-dx[ii,jj],box[1]-dx[ii,jj],box[2]-dy[ii,jj],box[3]-dy[ii,jj])
                         if background_subtraction:
                             if background_level==-1000:
                                 back_val=np.median(cut)
@@ -2133,13 +2146,22 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                         cut[cut<0]=1e-10
                         cut0[cut0<0]=1e-10
                         mult=cut0*cut
-                        if np.sum(mult!=0)>0:
-                            crls[ii,jj]=np.sum(mult)/np.sum(mult!=0)
+                        if np.nansum(mult!=0)>0:
+                            crls[ii,jj]=np.nansum(mult)/np.nansum(mult!=0)
 
+                from astropy.visualization import ImageNormalize, ZScaleInterval, LinearStretch, AsinhStretch
+
+                finite = crls[np.isfinite(crls)]
+                vmin, vmax = ZScaleInterval(contrast=0.5).get_limits(finite)   # compute limits on finite values only
+
+                norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=LinearStretch())
                 fig,ax=plt.subplots(figsize=(4,4))
                 xplot=np.append(xx,xx[1]-xx[0]+xx[-1])-0.5
                 yplot=np.append(yy,yy[1]-yy[0]+yy[-1])-0.5
-                ax.pcolormesh(xplot,yplot,crls.T)
+                
+                im = ax.imshow(crls.T, origin='lower', norm=norm, cmap='Greys',
+                    extent=[xplot[0], xplot[-1], yplot[0], yplot[-1]],
+                    interpolation='nearest', aspect='equal')                #fig.colorbar(im, ax=ax)
 
                 # find closest local maximum
                 max_conv=ndimage.filters.maximum_filter(crls,2*conv_filter+1)
@@ -2152,6 +2174,8 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                     xindex.append(x_center)
                     y_center=(dy.start+dy.stop-1)/2
                     yindex.append(y_center)
+                #    print(x_center,y_center)
+                #print(xindex,yindex)
                 xindex=np.array(xindex).astype(int)
                 yindex=np.array(yindex).astype(int)
                 index=((xindex>=conv_filter) & (xindex<2*crls_size-conv_filter) &
@@ -2159,8 +2183,12 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                 xindex=xindex[index]
                 yindex=yindex[index]
                 # filter out weak ones
-                max=np.max(max_conv[xindex,yindex])
-                med=np.median(crls)
+                #print(index)
+                
+                #print(2*crls_size-conv_filter)
+                #print(max_conv[xindex,yindex])
+                max=np.nanmax(max_conv[xindex,yindex])
+                med=np.nanmedian(crls)
                 index=np.where(max_conv[xindex,yindex] > 0.3*(max-med)+med)
                 xindex=xindex[index]
                 yindex=yindex[index]
@@ -2238,7 +2266,12 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                 #plt.clf()
                 xplot=(np.append(xx,xx[1]-xx[0]+xx[-1])-0.5)/upfactor+xshift[i]
                 yplot=(np.append(yy,yy[1]-yy[0]+yy[-1])-0.5)/upfactor+yshift[i]
-                ax.pcolormesh(xplot,yplot,crls.T,cmap='plasma')
+                #ax.pcolormesh(xplot,yplot,crls.T,cmap='plasma')
+
+                ax.imshow(crls.T, origin='lower', norm=norm, cmap='plasma',
+                    extent=[xplot[0], xplot[-1], yplot[0], yplot[-1]],
+                    interpolation='nearest', aspect='equal')                #fig.colorbar(im, ax=ax)
+
 
                 tmp=np.unravel_index(crls.argmax(),crls.shape)
                 xshift[i]+=xx[tmp[0]]/upfactor
@@ -2493,7 +2526,10 @@ def kcwi_astrometry(fnlist,imgfn='',wavebin=[-1.,-1.],display=True,search_size=-
         img0 = img0 - background_ref
         img0[img0 < 0] = 0
 
-
+    print("reading ref image: "+imgfn)
+    print("search_size,cov_filter,upfactor,box:",search_size,conv_filter,upfactor,box)
+    #plt.imshow(img,origin='lower',cmap='gray')
+    #plt.show()
     if nocrl==0:
 
         hdr_shift=hdr_img.copy()
@@ -2521,6 +2557,10 @@ def kcwi_astrometry(fnlist,imgfn='',wavebin=[-1.,-1.],display=True,search_size=-
                     mult=img0_shift[box[0]:box[1],box[2]:box[3]]*img[box[0]:box[1],box[2]:box[3]]
                 if np.sum(mult!=0)>0:
                     crls[ii,jj]=np.sum(mult)/np.sum(mult!=0)
+                else:
+                    plt.imshow(img0_shift,origin='lower',cmap='gray')
+                    plt.show()
+                    print('Warning: no overlap region found!')
 
         fig=plt.figure(1)
         plt.clf()

@@ -352,19 +352,19 @@ def kcwi_medfilter_actonone(args, par):
                         flagline[q100[q]] = -200
 
                         q100 = np.where(flagline == -100)[0]
-                        # need >= 10 good values for cubic spline
-                        if np.sum(qv) > 9:
+                        # need >= 20 good values for cubic spline
+                        if np.sum(qv) > 20:
                             cs = CubicSpline(np.where(qv)[0], line[qv])
                             line0[q100] = cs(q100)
                         else:
                             flagline0[q100] = -200
 
 
-                    # nearest neighbor
+                    # linear interpolation
                     q200 = np.where(flagline == -200)[0]
                     if len(q200) > 0:
                         if np.sum(qv) > 1:
-                            nn = interp1d(np.where(qv)[0], line[qv], kind='nearest',
+                            nn = interp1d(np.where(qv)[0], line[qv], kind='linear',
                                     bounds_error=False, fill_value='extrapolate')
                             line0[q200] = nn(q200)
                         elif np.sum(qv)==1:

@@ -961,12 +961,246 @@ def kcwi_resample_wave(hdu, newhdr, method='cubic',plot=False):
 
 
 
+# Keck II site, used to compute the parallactic angle and airmass for DAR
+KECK_LAT = 19.8263
+KECK_LON = -155.4747
+
+
+def kcwi_refractive_index(wave_vac, temperature=10., pressure_pa=61100.,
+                          humidity=50., co2=400.):
+    """
+    Refractive index of air.
+
+    Uses the Ciddor (1996) formula from ``ref_index`` (same as KCWI_DRP) when it
+    is installed, otherwise the Edlen (1966) formula with the temperature,
+    pressure and water vapour terms of Filippenko (1982, PASP 94, 715).
+
+    Args:
+        wave_vac (float or array): vacuum wavelength(s) in Angstrom.
+        temperature (float): air temperature (C).
+        pressure_pa (float): air pressure (Pa).
+        humidity (float): relative humidity (%).
+        co2 (float): CO2 concentration (umol/mol), Ciddor formula only.
+
+    Returns:
+        numpy.ndarray: refractive index n.
+    """
+    wave_vac = np.atleast_1d(np.asarray(wave_vac, dtype=float))
+    try:
+        import ref_index
+        return np.array([ref_index.ciddor(wave=w / 10., t=temperature,
+                                          p=pressure_pa, rh=humidity, co2=co2)
+                         for w in wave_vac], dtype=float)
+    except ImportError:
+        pass
+
+    sigma2 = (1e4 / wave_vac)**2  # vacuum wavenumber squared (um^-2)
+    # (n-1)*1e6 for dry air at 15 C and 760 mmHg
+    nm1 = 64.328 + 29498.1 / (146. - sigma2) + 255.4 / (41. - sigma2)
+    p_mmhg = pressure_pa / 133.322
+    nm1 = nm1 * p_mmhg * (1. + (1.049 - 0.0157 * temperature) * 1e-6 * p_mmhg) / \
+        (720.883 * (1. + 0.003661 * temperature))
+    # water vapour partial pressure (mmHg) from relative humidity
+    e_sat = 6.1121 * np.exp(17.502 * temperature / (240.97 + temperature))  # hPa
+    f_mmhg = humidity / 100. * e_sat * 0.750062
+    nm1 = nm1 - (0.0624 - 0.000680 * sigma2) / (1. + 0.003661 * temperature) * f_mmhg
+    return 1. + nm1 * 1e-6
+
+
+def kcwi_parallactic(ra, dec, mjd, lat=KECK_LAT, lon=KECK_LON):
+    """
+    Parallactic angle and zenith distance of a target.
+
+    Args:
+        ra, dec (float): target coordinates (deg).
+        mjd (float or array): UTC MJD (UT1 ~ UTC is accurate enough here).
+        lat, lon (float): site latitude and east longitude (deg).
+
+    Returns:
+        (numpy.ndarray, numpy.ndarray): parallactic angle (deg, position angle
+            of the zenith measured east of north) and zenith distance (deg).
+    """
+    days = np.asarray(mjd, dtype=float) + 2400000.5 - 2451545.0
+    lst = 280.46061837 + 360.98564736629 * days + lon
+    ha = np.deg2rad(lst - ra)
+    dec = np.deg2rad(dec)
+    lat = np.deg2rad(lat)
+    q = np.arctan2(np.sin(ha), np.tan(lat) * np.cos(dec) - np.sin(dec) * np.cos(ha))
+    cosz = np.sin(lat) * np.sin(dec) + np.cos(lat) * np.cos(dec) * np.cos(ha)
+    return np.rad2deg(q), np.rad2deg(np.arccos(cosz))
+
+
+def kcwi_dar_offsets(hdr, wave, wref, mode='average', nsamp=11,
+                     temperature=10., pressure_pa=61100., humidity=50.):
+    """
+    Apparent DAR displacement on the sky of each wavelength relative to wref.
+
+    Light at wavelength `wave` lands R = 206265 * (n(wave) - n(wref)) * tan(z)
+    arcsec from where light at `wref` lands, towards the zenith (position angle =
+    parallactic angle). This is the same model as CorrectDar in KCWI_DRP.
+
+    Args:
+        hdr (astropy.io.fits.Header): header of an individual cube. Needs
+            AIRMASS and PARANG, plus DATE-BEG, DATE-END (or TELAPSE), CRVAL1
+            and CRVAL2 for mode='average'.
+        wave (array): vacuum wavelengths (Angstrom).
+        wref (float): reference wavelength (Angstrom), where the offset is 0.
+        mode (str): 'average' averages the DAR vector over the exposure,
+            computed from the exposure start/end times. 'header' uses the
+            AIRMASS and PARANG keywords (start of the exposure), as KCWI_DRP
+            does.
+        nsamp (int): number of time samples for mode='average'.
+        temperature, pressure_pa, humidity: atmospheric conditions (C, Pa, %).
+
+    Returns:
+        (numpy.ndarray, numpy.ndarray): east and north displacement in arcsec.
+    """
+    wave = np.atleast_1d(np.asarray(wave, dtype=float))
+    n = kcwi_refractive_index(np.append(wave, wref), temperature=temperature,
+                              pressure_pa=pressure_pa, humidity=humidity)
+    dn = n[:-1] - n[-1]
+
+    q_hdr = hdr['PARANG']
+    z_hdr = np.rad2deg(np.arccos(1. / hdr['AIRMASS']))
+
+    if mode == 'average':
+        try:
+            t0 = time.Time(hdr['DATE-BEG'], scale='utc').mjd
+            if 'DATE-END' in hdr:
+                t1 = time.Time(hdr['DATE-END'], scale='utc').mjd
+            else:
+                t1 = t0 + hdr['TELAPSE'] / 86400.
+        except (KeyError, ValueError):
+            print('     DAR: no exposure start/end time, using AIRMASS/PARANG.')
+            mode = 'header'
+
+    if mode == 'average':
+        q, z = kcwi_parallactic(hdr['CRVAL1'], hdr['CRVAL2'],
+                                np.linspace(t0, t1, nsamp))
+        # sanity check against the header values (start of exposure)
+        dq = (q[0] - q_hdr + 180.) % 360. - 180.
+        print('     DAR: PARANG %.1f -> %.1f deg, airmass %.3f -> %.3f '
+              '(header: %.1f deg, %.3f)' % (q[0], q[-1], 1. / np.cos(np.deg2rad(z[0])),
+                                            1. / np.cos(np.deg2rad(z[-1])), q_hdr,
+                                            hdr['AIRMASS']))
+        if abs(dq) > 5. or abs(z[0] - z_hdr) > 2.:
+            print('     DAR WARNING: computed PARANG/airmass disagree with the '
+                  'header. Check DATE-BEG and the target coordinates.')
+    elif mode == 'header':
+        q = np.array([q_hdr])
+        z = np.array([z_hdr])
+    else:
+        raise ValueError("DAR mode must be 'average' or 'header'.")
+
+    tanz = np.tan(np.deg2rad(z))
+    east = 206265. * np.outer(dn, tanz * np.sin(np.deg2rad(q))).mean(axis=1)
+    north = 206265. * np.outer(dn, tanz * np.cos(np.deg2rad(q))).mean(axis=1)
+    return east, north
+
+
+def kcwi_dar_chunks(east, north, tol):
+    """
+    Split the wavelength axis into contiguous chunks in which the DAR offsets
+    vary by no more than `tol` (arcsec) in either direction.
+
+    Returns:
+        list of (start, stop) plane indices.
+    """
+    chunks = []
+    k0 = 0
+    nwave = len(east)
+    for k in range(1, nwave + 1):
+        if k == nwave or np.ptp(east[k0:k + 1]) > tol or np.ptp(north[k0:k + 1]) > tol:
+            chunks.append((k0, k))
+            k0 = k
+    return chunks
+
+
+def _kcwi_mproject(hdu_in, hdr_out, tmpbase, drizzle, montagepy):
+    """Run mProjectCube on an in-memory cube; returns (data, area)."""
+    infn = tmpbase + '.in.fits'
+    hdrfn = tmpbase + '.hdr'
+    outfn = tmpbase + '.out.fits'
+    areafn = tmpbase + '.out_area.fits'
+    hdu_in.writeto(infn, overwrite=True)
+    hdr_out.totextfile(hdrfn, overwrite=True)
+    if montagepy:
+        mProjectCube(infn, outfn, hdrfn, drizzle=drizzle, energyMode=False,
+                     fullRegion=True)
+    else:
+        os.system("mProjectCube -z " + str(drizzle) + " -f " + infn + " " +
+                  outfn + " " + hdrfn)
+
+    shape = (hdr_out['NAXIS3'], hdr_out['NAXIS2'], hdr_out['NAXIS1'])
+    if os.path.isfile(outfn):
+        data = fits.getdata(outfn)
+        area = fits.getdata(areafn)
+    else:
+        print('     Warning: mProjectCube produced no output for ' + infn)
+        data = np.full(shape, np.nan)
+        area = np.zeros(shape)
+    for f in (infn, hdrfn, outfn, areafn):
+        if os.path.isfile(f):
+            os.remove(f)
+    return data, area
+
+
+def kcwi_project_dar(infn, outfn, areafn, hdrfn, east, north, chunks, project,
+                     fill_nonfinite=None):
+    """
+    Project a cube onto the stacking grid, correcting DAR on the way.
+
+    Each wavelength chunk gets its CRVAL1/CRVAL2 shifted by minus the chunk's
+    mean DAR offset before projection, so the drizzle (or interpolation) that
+    places the cube on the output grid also removes DAR. No extra resampling
+    step is needed.
+
+    Args:
+        infn (str): input (trimmed) cube; must be on the output wavelength grid.
+        outfn, areafn (str): output cube and area file names.
+        hdrfn (str): Montage-style header file of the output grid.
+        east, north (array): DAR offsets per plane (arcsec), from
+            kcwi_dar_offsets.
+        chunks (list): (start, stop) plane indices, from kcwi_dar_chunks.
+        project (callable): project(hdu_in, hdr_out) -> (data, area).
+        fill_nonfinite (float): if set, replace non-finite input values.
+    """
+    hdu = fits.open(infn)[0]
+    hdr_out = fits.Header.fromtextfile(hdrfn)
+    if not kcwi_check_samewave(hdu.header, hdr_out):
+        raise ValueError('DAR correction requires the cube to be on the output '
+                         'wavelength grid: ' + infn)
+    data_in = hdu.data
+    if fill_nonfinite is not None:
+        data_in[~np.isfinite(data_in)] = fill_nonfinite
+
+    shape = (hdr_out['NAXIS3'], hdr_out['NAXIS2'], hdr_out['NAXIS1'])
+    data_out = np.full(shape, np.nan)
+    area_out = np.zeros(shape)
+    cosdec = np.cos(np.deg2rad(hdu.header['CRVAL2']))
+    for k0, k1 in chunks:
+        hdr_in = hdu.header.copy()
+        hdr_in['CRPIX3'] = hdu.header['CRPIX3'] - k0
+        hdr_in['CRVAL1'] = hdu.header['CRVAL1'] - np.mean(east[k0:k1]) / 3600. / cosdec
+        hdr_in['CRVAL2'] = hdu.header['CRVAL2'] - np.mean(north[k0:k1]) / 3600.
+        hdr_k = hdr_out.copy()
+        hdr_k['NAXIS3'] = k1 - k0
+        hdr_k['CRPIX3'] = hdr_out['CRPIX3'] - k0
+        data_out[k0:k1], area_out[k0:k1] = project(
+            fits.PrimaryHDU(data_in[k0:k1], hdr_in), hdr_k)
+
+    fits.PrimaryHDU(data_out, hdr_out).writeto(outfn, overwrite=True)
+    fits.PrimaryHDU(area_out, hdr_out).writeto(areafn, overwrite=True)
+
+
 def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscale_y=0.,
                dimension=[0,0],orientation=-1000.,cubed=False,drizzle=0,weights=[],
                wave_ref=[0, 0], dwave=0, nwave=0, wave_interp_method='cubic',
                overwrite=False,keep_trim=False,keep_mont=False,method='drizzle',use_astrom=False,
                use_regmask=True, low_mem=False, montagepy=flag_montagepy, crr=False, crr_save_files=False,
-               crrthresh=100, medcube=False, nsigma_clip=10, npix_trim = 3):
+               crrthresh=100, medcube=False, nsigma_clip=10, npix_trim = 3,
+               dar=False, dar_wref=0., dar_tol=0.03, dar_mode='average',
+               dar_temperature=10., dar_pressure=61100., dar_humidity=50.):
     """
     Stacking the individual data cubes.
 
@@ -1016,6 +1250,24 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             remove residual cosmic rays. Default=1.5.
         npix_trim (int): number of pixels to trim from the edges of a cube. Default = 3.
             May want npix_trim = 1 for Large slicer.
+        dar (bool): correct differential atmospheric refraction while
+            projecting the cubes, instead of shifting each cube in KCWI_DRP.
+            The input cubes must not be DAR corrected (reduce with
+            DAR_apply = False in KCWI_DRP). Each cube is split into wavelength
+            chunks whose WCS is offset by the DAR at that wavelength, so the
+            drizzle does the correction without an extra resampling step.
+        dar_wref (float): wavelength (Angstrom) with zero DAR offset. Should be
+            the center of the wavelength range used by kcwi_align, so the
+            shifts in the .shift.list stay valid. Default: center of the
+            parfile 'wavebin', or of WAVGOOD0-WAVGOOD1 if not set.
+        dar_tol (float): maximum spread of DAR offsets (arcsec) within one
+            wavelength chunk. Default = 0.03.
+        dar_mode (str): 'average' (default) averages the DAR over the
+            exposure from DATE-BEG/DATE-END; 'header' uses the AIRMASS and
+            PARANG keywords (start of exposure), as KCWI_DRP does.
+        dar_temperature, dar_pressure, dar_humidity (float): atmospheric
+            temperature (C), pressure (Pa) and relative humidity (%) for the
+            refractive index. Defaults match KCWI_DRP.
 
     Returns:
         None
@@ -1200,6 +1452,14 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
         hdr0['CD3_3'] = dwave
 
     hdr0.totextfile(fnhdr,overwrite=1)
+
+    if dar:
+        if dar_wref == 0:
+            if par['wavebin'][0] != -1:
+                dar_wref = np.mean(par['wavebin'])
+            else:
+                dar_wref = 0.5 * (hdrtmp['WAVGOOD0'] + hdrtmp['WAVGOOD1'])
+        print('DAR correction during projection: reference wavelength = %.1f A' % dar_wref)
 
     # project
     #void=mProjectCube(fn[0],outfn[0],'kcwi_stack/tmp.hdr',drizzle=0.7,energyMode=True)
@@ -1447,7 +1707,7 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             hdu_v.data = hdu_v.data * fluxnorm[i]**2
 
             # wavelength interpolation
-            if method=='drizzle':
+            if method=='drizzle' or dar:
                 # "reproject" package can handle wavelength interpolation, only
                 # Montage need this step.
                 if not kcwi_check_samewave(hdu_i.header, hdr0):
@@ -1485,7 +1745,43 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
 
         if (not os.path.isfile(montfn)) or overwrite==True:
         #if True:
-            if method.lower()!='drizzle':
+            if dar:
+                hdr_t = fits.getheader(trimfn[i])
+                if hdr_t.get('DARCOR', False):
+                    raise ValueError(os.path.basename(fn[i]) + ' is already DAR '
+                                     'corrected (DARCOR = T). Reduce it with '
+                                     'DAR_apply = False in KCWI_DRP to use dar=True.')
+                dar_e, dar_n = kcwi_dar_offsets(hdr_t, get_wav_axis(hdr_t), dar_wref,
+                                                mode=dar_mode,
+                                                temperature=dar_temperature,
+                                                pressure_pa=dar_pressure,
+                                                humidity=dar_humidity)
+                dar_chunks = kcwi_dar_chunks(dar_e, dar_n, dar_tol)
+                print('     DAR: E %.2f to %.2f arcsec, N %.2f to %.2f arcsec, '
+                      '%d wavelength chunks' % (dar_e.min(), dar_e.max(),
+                                                dar_n.min(), dar_n.max(),
+                                                len(dar_chunks)))
+
+                infns = [trimfn[i], trimvfn[i], trimmfn[i], trimefn[i]]
+                outfns = [montfn, montvfn, montmfn, montefn]
+                if method.lower()=='drizzle':
+                    for infn_k, outfn_k in zip(infns, outfns):
+                        proj = lambda h, hd, tmp=outfn_k.replace('.fits', '.darchunk'): \
+                            _kcwi_mproject(h, hd, tmp, drizzle, montagepy)
+                        kcwi_project_dar(infn_k, outfn_k, outfn_k.replace('.fits', '_area.fits'),
+                                         fnhdr, dar_e, dar_n, dar_chunks, proj)
+                else:
+                    orders = [method, method, 'bilinear', 'bilinear']
+                    for infn_k, outfn_k, order_k in zip(infns, outfns, orders):
+                        # chunk input and output share the wavelength grid
+                        proj = lambda h, hd, order_k=order_k: \
+                            reproject_interp(h, hd, order=order_k)
+                        kcwi_project_dar(infn_k, outfn_k,
+                                         outfn_k.replace('.'+method_flag, '.'+method_flag+'_area'),
+                                         fnhdr, dar_e, dar_n, dar_chunks, proj,
+                                         fill_nonfinite=0.)
+
+            elif method.lower()!='drizzle':
                 newhdr=fits.Header.fromtextfile(fnhdr)
 
                 hdut=(fits.open(trimfn[i]))[0]

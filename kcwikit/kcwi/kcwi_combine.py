@@ -210,7 +210,7 @@ def _resample_block(st, yi, xi, z0, z1, shape_out):
 
 
 def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
-                   grow_xy=2, grow_z=1, grow_nsig=2., pad_xy=0):
+                   grow_xy=2, grow_z=2, grow_nsig=2., pad_xy=0, loo=None):
     """
     Flag positive outliers (cosmic rays) in each of N aligned cubes by comparing
     each cube with the other ones on the same grid.
@@ -241,6 +241,10 @@ def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
     than a fixed box. pad_xy then adds an unconditional spatial margin
     (e.g. 1 pixel) for the low-level wings spread by resampling.
 
+    With N >= 5 cubes the median of ALL of them is used as the comparison
+    estimate (one outlier does not move it), computed once instead of once per
+    cube; with fewer, the median of the others is used. `loo` overrides that.
+
     Args:
         I, V (ndarray [N, nz, ny, nx]): intensity and variance on a common grid.
         good (bool ndarray [N, nz, ny, nx]): valid voxels.
@@ -256,25 +260,42 @@ def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
     s_xy[1] = True                                    # 8-connected in (y, x), same slice
     s_z = np.zeros((3, 3, 3), dtype=bool)
     s_z[:, 1, 1] = True                               # along wavelength only
+    if loo is None:
+        loo = (N < 5)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
+        if not loo:
+            # median of all cubes: robust to one outlier, computed once
+            n_all = np.sum(good, axis=0)
+            est_all = np.nanmedian(Ig, axis=0)
+            var_all = (np.where(n_all >= 3, np.pi / 2., 1.) *
+                       np.nanmean(Vg, axis=0) / np.maximum(n_all, 1))
+            L_all = ndimage.maximum_filter(np.nan_to_num(np.abs(est_all)),
+                                           size=(int(zwindow), int(window), int(window)),
+                                           mode='nearest')
         for k in range(N):
-            oth = [j for j in range(N) if j != k]
-            n_oth = np.sum(good[oth], axis=0)
-            if len(oth) == 1:
-                est, var_est = Ig[oth[0]], Vg[oth[0]]
+            if not loo:
+                est, var_est, n_oth = est_all, var_all, n_all - good[k]
             else:
-                est = np.nanmedian(Ig[oth], axis=0)
-                # variance of the median of n values ~ (pi/2) <V>/n; plain mean for n<=2
-                corr = np.where(n_oth >= 3, np.pi / 2., 1.)
-                var_est = corr * np.nanmean(Vg[oth], axis=0) / np.maximum(n_oth, 1)
+                oth = [j for j in range(N) if j != k]
+                n_oth = np.sum(good[oth], axis=0)
+                if len(oth) == 1:
+                    est, var_est = Ig[oth[0]], Vg[oth[0]]
+                else:
+                    est = np.nanmedian(Ig[oth], axis=0)
+                    # variance of the median of n values ~ (pi/2) <V>/n; plain mean for n<=2
+                    corr = np.where(n_oth >= 3, np.pi / 2., 1.)
+                    var_est = corr * np.nanmean(Vg[oth], axis=0) / np.maximum(n_oth, 1)
             testable = good[k] & (n_oth > 0) & np.isfinite(est) & np.isfinite(var_est)
             sig = np.sqrt(np.where(testable, V[k] + var_est, np.inf))
             D = np.where(testable, I[k] - est, 0.)
             if zmed and zmed > 1:
                 D = D - ndimage.median_filter(D, size=(int(zmed), 1, 1), mode='nearest')
-            L = ndimage.maximum_filter(np.nan_to_num(np.abs(est)),
-                                       size=(int(zwindow), int(window), int(window)), mode='nearest')
+            if loo:
+                L = ndimage.maximum_filter(np.nan_to_num(np.abs(est)),
+                                           size=(int(zwindow), int(window), int(window)), mode='nearest')
+            else:
+                L = L_all
             f = testable & (D > nsig * sig) & (D > rel * L)
             if f.any():
                 cand = testable & (D > grow_nsig * sig)
@@ -303,7 +324,7 @@ def kcwi_combine_stacks(cubefns, outname, wavebin=None, box=None, search_size=10
                         weighting='exposure', fluxscale=None, wave_interp_method='cubic',
                         min_overlap=0.3, nsig_flux=3., crr=False, crr_nsig=5.,
                         crr_rel=0.5, crr_window=5, crr_zwindow=3, crr_zmed=15,
-                        crr_grow_xy=2, crr_grow_z=1, crr_grow_nsig=2., crr_pad_xy=0,
+                        crr_grow_xy=2, crr_grow_z=2, crr_grow_nsig=2., crr_pad_xy=0,
                         zblock=200, display=True, overwrite=True):
     """
     Align and co-add stacked KCWI cubes (outputs of kcwi_stack).
@@ -624,7 +645,7 @@ def kcwi_combine_stacks(cubefns, outname, wavebin=None, box=None, search_size=10
     if crr:
         for k in range(N):
             frac = nrej[k] / max(ntest[k], 1)
-            print('  {}: rejected {} voxels ({:.3g}% of voxels rejected)'.format(
+            print('  {}: rejected {} voxels ({:.3g}% of overlapping voxels)'.format(
                 os.path.basename(cubefns[k]), nrej[k], 100 * frac))
             if frac > 0.01:
                 print('  [WARNING] >1% rejected. Check the alignment/flux scale, or raise '

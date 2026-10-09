@@ -28,6 +28,7 @@ from fpdf import FPDF #fpdf2
 from tqdm import tqdm
 import pdb
 import time as ostime
+import warnings
 # from specutils.utils import wcs_utils
 import pathlib
 
@@ -961,12 +962,160 @@ def kcwi_resample_wave(hdu, newhdr, method='cubic',plot=False):
 
 
 
+def _crr_flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
+                       grow_xy=2, grow_z=2, grow_nsig=2., pad_xy=0, loo=None):
+    """
+    Flag positive outliers (cosmic rays) in each of N cubes on a common grid by
+    comparing each cube with the other ones (used by kcwi_stack with crr_split).
+
+    For cube k, the comparison estimate `est` is the other cube (N=2) or the
+    median of the others (N>=3). The excess D = I_k - est has a running median
+    along wavelength (zmed pixels) subtracted, so smooth differences from
+    seeing, alignment or flux calibration are removed; cosmic rays are narrower
+    than the instrumental resolution. A voxel is flagged only if BOTH
+        absolute:  D > nsig * sqrt(V_k + var_est)
+        relative:  D > rel * L,  L = local max of |est| in a (zwindow, window, window) box.
+    Flags are then grown, first spectrally (up to grow_z pixels) and then
+    spatially (up to grow_xy pixels, 8-connected), only into connected
+    neighbors with D > grow_nsig * sigma. pad_xy adds an unconditional
+    spatial margin.
+
+    With N >= 5 cubes the median of ALL of them is used as the comparison
+    estimate (one outlier does not move it), which is computed once instead of
+    once per cube; with fewer, the median of the others (leave-one-out) is used.
+    `loo` overrides that choice.
+
+    Args:
+        I, V (ndarray [N, nz, ny, nx]): intensity and variance.
+        good (bool ndarray [N, nz, ny, nx]): valid voxels.
+
+    Returns:
+        bool ndarray [N, nz, ny, nx]: outlier flags.
+    """
+    N = I.shape[0]
+    Ig = np.where(good, I, np.nan)
+    Vg = np.where(good, V, np.nan)
+    flags = np.zeros(I.shape, dtype=bool)
+    s_xy = np.zeros((3, 3, 3), dtype=bool)
+    s_xy[1] = True
+    s_z = np.zeros((3, 3, 3), dtype=bool)
+    s_z[:, 1, 1] = True
+    if loo is None:
+        loo = (N < 5)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        if not loo:
+            # median of all cubes: robust to one outlier, computed once
+            n_all = np.sum(good, axis=0)
+            est_all = np.nanmedian(Ig, axis=0)
+            var_all = (np.where(n_all >= 3, np.pi / 2., 1.) *
+                       np.nanmean(Vg, axis=0) / np.maximum(n_all, 1))
+            L_all = ndimage.maximum_filter(np.nan_to_num(np.abs(est_all)),
+                                           size=(int(zwindow), int(window), int(window)),
+                                           mode='nearest')
+        for k in range(N):
+            if not loo:
+                est, var_est, n_oth = est_all, var_all, n_all - good[k]
+            else:
+                oth = [j for j in range(N) if j != k]
+                n_oth = np.sum(good[oth], axis=0)
+                if len(oth) == 1:
+                    est, var_est = Ig[oth[0]], Vg[oth[0]]
+                else:
+                    est = np.nanmedian(Ig[oth], axis=0)
+                    corr = np.where(n_oth >= 3, np.pi / 2., 1.)
+                    var_est = corr * np.nanmean(Vg[oth], axis=0) / np.maximum(n_oth, 1)
+            testable = good[k] & (n_oth > 0) & np.isfinite(est) & np.isfinite(var_est)
+            sig = np.sqrt(np.where(testable, V[k] + var_est, np.inf))
+            D = np.where(testable, I[k] - est, 0.)
+            if zmed and zmed > 1:
+                D = D - ndimage.median_filter(D, size=(int(zmed), 1, 1), mode='nearest')
+            if loo:
+                L = ndimage.maximum_filter(np.nan_to_num(np.abs(est)),
+                                           size=(int(zwindow), int(window), int(window)), mode='nearest')
+            else:
+                L = L_all
+            f = testable & (D > nsig * sig) & (D > rel * L)
+            if f.any():
+                cand = testable & (D > grow_nsig * sig)
+                for _ in range(int(grow_z)):
+                    new = ndimage.binary_dilation(f, structure=s_z) & cand & ~f
+                    if not new.any():
+                        break
+                    f |= new
+                for _ in range(int(grow_xy)):
+                    new = ndimage.binary_dilation(f, structure=s_xy) & cand & ~f
+                    if not new.any():
+                        break
+                    f |= new
+                if pad_xy > 0:
+                    f = ndimage.binary_dilation(f, structure=s_xy, iterations=int(pad_xy)) & testable
+            flags[k] = f
+    return flags
+
+
+def _crr_frame_reject(sub, subv, ok, flag_g, est, vest, frame_nsig=3.):
+    """
+    Decide which frame(s) of a group cause the outliers flagged in that group
+    (used when crr_split groups several frames together, e.g. split-half).
+
+    A frame j is rejected at a flagged voxel if
+        (I_j - est_other)                                   > frame_nsig * sigma   and
+        (I_j - median of the other frames of the same group) > frame_nsig * sigma,
+    where the second test is skipped when the group has only one valid frame
+    there. If no frame passes (e.g. in the grown wings of a cosmic ray), the
+    frame with the largest significance is rejected, so every flagged voxel is
+    cleaned.
+
+    Args:
+        sub, subv (ndarray [m, ...]): intensity and variance of the group's frames.
+        ok (bool ndarray [m, ...]): valid voxels of those frames.
+        flag_g (bool ndarray [...]): voxels flagged for this group.
+        est, vest (ndarray [...]): comparison estimate from the other group(s).
+
+    Returns:
+        bool ndarray [m, ...]: rejection per frame of the group.
+    """
+    rej = np.zeros(sub.shape, dtype=bool)
+    base = flag_g & np.isfinite(est) & np.isfinite(vest)
+    if not base.any():
+        return rej
+    m = sub.shape[0]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        z = np.where(ok, (sub - est) / np.sqrt(subv + vest), -np.inf)
+        subg = np.where(ok, sub, np.nan)
+        subvg = np.where(ok, subv, np.nan)
+        for j in range(m):
+            oth = [k for k in range(m) if k != j]
+            if len(oth) == 0:
+                rej[j] = base & ok[j] & (z[j] > frame_nsig)
+                continue
+            n_o = np.sum(ok[oth], axis=0)
+            med = np.nanmedian(subg[oth], axis=0)
+            corr = np.where(n_o >= 3, np.pi / 2., 1.)
+            vmed = corr * np.nanmean(subvg[oth], axis=0) / np.maximum(n_o, 1)
+            z2 = (sub[j] - med) / np.sqrt(subv[j] + vmed)
+            loo = (n_o == 0) | (np.nan_to_num(z2, nan=-np.inf) > frame_nsig)
+            rej[j] = base & ok[j] & (z[j] > frame_nsig) & loo
+        # fallback: nothing passed, so reject the most deviant valid frame
+        left = base & ~rej.any(axis=0) & ok.any(axis=0)
+        if left.any():
+            jmax = np.argmax(z, axis=0)
+            for j in range(m):
+                rej[j] |= left & (jmax == j)
+    return rej
+
+
 def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscale_y=0.,
                dimension=[0,0],orientation=-1000.,cubed=False,drizzle=0,weights=[],
                wave_ref=[0, 0], dwave=0, nwave=0, wave_interp_method='cubic',
                overwrite=False,keep_trim=False,keep_mont=False,method='drizzle',use_astrom=False,
                use_regmask=True, low_mem=False, montagepy=flag_montagepy, crr=False, crr_save_files=False,
-               crrthresh=100, medcube=False, nsigma_clip=10, npix_trim = 3):
+               crrthresh=100, medcube=False, nsigma_clip=10, npix_trim = 3,
+               crr_split=False, crr_split_mode='frame', crr_nsig=5., crr_rel=0.5,
+               crr_window=5, crr_zwindow=3, crr_zmed=15, crr_grow_xy=2, crr_grow_z=2,
+               crr_grow_nsig=2., crr_pad_xy=0, crr_frame_nsig=3., crr_zblock=100):
     """
     Stacking the individual data cubes.
 
@@ -1016,6 +1165,45 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             remove residual cosmic rays. Default=1.5.
         npix_trim (int): number of pixels to trim from the edges of a cube. Default = 3.
             May want npix_trim = 1 for Large slicer.
+        crr_split (bool): cosmic-ray rejection after the frames have been shifted
+            and projected onto the common grid. Each frame (or each group of
+            frames, see crr_split_mode) is compared with the median of the
+            others. A voxel is flagged only if its excess, after a running
+            median along wavelength is removed, is both significant compared
+            with the noise (crr_nsig) and large compared with the local source
+            level (crr_rel); see _crr_flag_outliers. Only positive outliers are
+            rejected. The flagged voxels are masked in that frame alone before
+            the final stack. Can be combined with crr (which runs first).
+        crr_split_mode (str or array): how the frames are compared.
+            'frame' (default): every frame is compared with the median of all
+                the other frames. The most sensitive option; needs >= 3 frames
+                to be robust (>= 4-5 is comfortable).
+            'half': first half of the list against the second half, each
+                co-added with the stacking weights. Less sensitive (the cosmic
+                ray is diluted by the frames of its own half) but usable with
+                few frames or noisy individual frames; the responsible frame(s)
+                of the flagged half are then identified (see _crr_frame_reject).
+            'alternate': even frames against odd frames.
+            array: one group label per frame, for custom groupings.
+        crr_nsig (float): absolute threshold on the excess [sigma]. In 'frame'
+            mode the comparison is per frame, so raise it (6-7) if the noise
+            of the individual frames is underestimated.
+        crr_rel (float): relative threshold, excess > crr_rel * local source level.
+        crr_window (int): spatial size (pixels) of the local-level box, about the
+            seeing FWHM or larger.
+        crr_zwindow (int): spectral size (pixels) of the local-level box.
+        crr_zmed (int): width (pixels) of the running median along wavelength
+            subtracted from the excess. 0 disables it.
+        crr_grow_xy (int): maximum spatial growth (pixels, 8-connected) into
+            connected neighbors with excess > crr_grow_nsig * sigma.
+        crr_grow_z (int): maximum spectral growth (pixels), same rule.
+        crr_grow_nsig (float): threshold for growing.
+        crr_pad_xy (int): unconditional spatial margin (pixels). 0 = off.
+        crr_frame_nsig (float): threshold for picking the responsible frame(s)
+            at a flagged voxel. Only used when a group holds several frames.
+        crr_zblock (int): number of wavelength slices processed at a time when
+            flagging. Memory scales as n_frames * crr_zblock * nx * ny; lower it
+            for many frames or a large field.
 
     Returns:
         None
@@ -1596,6 +1784,126 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
 
 
 
+    # ------------------------------------------------------------------
+    # crr_split: cosmic-ray rejection by comparing frames (or groups of
+    # frames) with each other on the common grid, after shifting/projection.
+    # ------------------------------------------------------------------
+    if crr_split:
+        nfn = len(fn)
+        if isinstance(crr_split_mode, str):
+            if crr_split_mode == 'frame':
+                crr_groups = np.arange(nfn)                     # each frame on its own
+            elif crr_split_mode == 'half':
+                crr_groups = (np.arange(nfn) >= nfn // 2).astype(int)
+            elif crr_split_mode == 'alternate':
+                crr_groups = (np.arange(nfn) % 2).astype(int)
+            else:
+                raise ValueError("crr_split_mode must be 'frame', 'half', 'alternate', or an array")
+        else:
+            crr_groups = np.asarray(crr_split_mode).astype(int)
+            if len(crr_groups) != nfn:
+                raise ValueError('crr_split_mode array must have one label per frame')
+            crr_groups = np.unique(crr_groups, return_inverse=True)[1]
+        crr_ngroup = int(crr_groups.max()) + 1
+        if nfn < 2 or crr_ngroup < 2:
+            print('crr_split: need at least two groups; skipping.')
+            crr_split = False
+
+    if crr_split:
+        crr_members = [np.where(crr_groups == g)[0] for g in range(crr_ngroup)]
+        print('CR rejection (crr_split, mode={}): {} group(s): {}'.format(
+            crr_split_mode if isinstance(crr_split_mode, str) else 'custom',
+            crr_ngroup, [list(m) for m in crr_members]))
+        nz3 = hdr0['NAXIS3']
+        ny3 = dimension[1]
+        nx3 = dimension[0]
+        crr_rej = np.zeros((nfn, nz3, ny3, nx3), dtype=bool)
+        pad = max(int(crr_zwindow), int(crr_zmed)) // 2 + int(crr_grow_z) + 1
+        n_test = 0
+        for z0 in tqdm(range(0, nz3, crr_zblock)):
+            z1 = min(z0 + crr_zblock, nz3)
+            p0, p1 = max(z0 - pad, 0), min(z1 + pad, nz3)
+            nzb = p1 - p0
+            f_i = np.zeros((nfn, nzb, ny3, nx3), dtype=np.float32)
+            f_v = np.zeros_like(f_i)
+            f_w = np.zeros_like(f_i)
+            f_ok = np.zeros(f_i.shape, dtype=bool)
+            for i in range(nfn):
+                if low_mem == False:
+                    c_i, c_v = data0[i, p0:p1], vdata0[i, p0:p1]
+                    c_m, c_e = mdata0[i, p0:p1], edata0[i, p0:p1]
+                else:
+                    c_i = np.nan_to_num(fits.open(montfns[i], memmap=True)[0].data[p0:p1])
+                    c_v = np.nan_to_num(fits.open(montvfns[i], memmap=True)[0].data[p0:p1])
+                    c_m = np.ceil(fits.open(montmfns[i], memmap=True)[0].data[p0:p1])
+                    c_m[~np.isfinite(c_m)] = 128
+                    c_e = np.nan_to_num(fits.open(montefns[i], memmap=True)[0].data[p0:p1])
+                ok = (c_m == 0) & np.isfinite(c_i) & np.isfinite(c_v) & (c_v != 0) & (c_e > 0)
+                f_i[i], f_v[i], f_ok[i] = c_i, c_v, ok
+                if medcube:
+                    f_w[i] = ok
+                elif len(weights) == 0:
+                    f_w[i] = np.where(ok, c_e / fluxnorm[i]**2, 0.)
+                else:
+                    f_w[i] = np.where(ok, float(weights[i]), 0.)
+
+            # group cubes (a group of one frame is just that frame)
+            if crr_ngroup == nfn:
+                g_i, g_v, g_good = f_i, f_v, f_ok
+            else:
+                g_i = np.zeros((crr_ngroup, nzb, ny3, nx3))
+                g_v = np.zeros_like(g_i)
+                g_good = np.zeros(g_i.shape, dtype=bool)
+                for g in range(crr_ngroup):
+                    mem = crr_members[g]
+                    w = f_w[mem]
+                    wsum = w.sum(axis=0)
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        g_i[g] = np.where(wsum > 0, (w * np.where(f_ok[mem], f_i[mem], 0.)).sum(axis=0) / wsum, np.nan)
+                        g_v[g] = np.where(wsum > 0, (w**2 * np.where(f_ok[mem], f_v[mem], 0.)).sum(axis=0) / wsum**2, np.nan)
+                    g_good[g] = (wsum > 0) & np.isfinite(g_i[g]) & np.isfinite(g_v[g]) & (g_v[g] > 0)
+
+            flags = _crr_flag_outliers(g_i, g_v, g_good, nsig=crr_nsig, rel=crr_rel,
+                                       window=crr_window, zwindow=crr_zwindow, zmed=crr_zmed,
+                                       grow_xy=crr_grow_xy, grow_z=crr_grow_z,
+                                       grow_nsig=crr_grow_nsig, pad_xy=crr_pad_xy)
+            c = slice(z0 - p0, z0 - p0 + (z1 - z0))
+            n_test += int((g_good.sum(axis=0) > 1)[c].sum())
+            for g in range(crr_ngroup):
+                mem = crr_members[g]
+                if not flags[g].any():
+                    continue
+                if len(mem) == 1:
+                    crr_rej[mem[0], z0:z1] = (flags[g] & f_ok[mem[0]])[c]
+                    continue
+                # a group of several frames: find the responsible frame(s)
+                oth = [h for h in range(crr_ngroup) if h != g]
+                if len(oth) == 1:
+                    est, vest = g_i[oth[0]], g_v[oth[0]]
+                else:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore', RuntimeWarning)
+                        n_o = g_good[oth].sum(axis=0)
+                        est = np.nanmedian(np.where(g_good[oth], g_i[oth], np.nan), axis=0)
+                        vest = (np.where(n_o >= 3, np.pi / 2., 1.) *
+                                np.nanmean(np.where(g_good[oth], g_v[oth], np.nan), axis=0) /
+                                np.maximum(n_o, 1))
+                rej = _crr_frame_reject(f_i[mem], f_v[mem], f_ok[mem], flags[g], est, vest,
+                                        frame_nsig=crr_frame_nsig)
+                for jj, fr in enumerate(mem):
+                    crr_rej[fr, z0:z1] = rej[jj][c]
+            del f_i, f_v, f_w, f_ok, g_i, g_v, g_good, flags
+
+        crr_nrej_frame = crr_rej.reshape(nfn, -1).sum(axis=1).astype(np.int64)
+        for i in range(nfn):
+            frac = crr_nrej_frame[i] / max(n_test, 1)
+            print('  {}: {} voxels rejected ({:.3g}% of testable voxels)'.format(
+                os.path.basename(fn[i]), crr_nrej_frame[i], 100. * frac))
+            if frac > 0.01:
+                print('  [WARNING] >1% rejected. Check the alignment and flux scaling, '
+                      'or raise crr_rel / crr_nsig.')
+        crr_nrej_3d = np.zeros((nx3, ny3, nz3), dtype=np.int16)
+
     # Stacking!!!
     print('Stacking...')
     data_3d=np.zeros((dimension[0],dimension[1],hdr0['NAXIS3']),dtype=np.float64)
@@ -1645,6 +1953,14 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
 
             clip_mask = (np.abs(clip_img - clip_med) > clip_std * nsigma_clip)
             mask[clip_mask]=1
+
+        # crr_split: mask the voxels rejected in each frame
+        if crr_split:
+            rej_col = crr_rej[:, :, :, ii]
+            for fr in range(len(fn)):
+                if rej_col[fr].any():
+                    mask[fr][rej_col[fr]] = 1
+            crr_nrej_3d[ii, :, :] = np.transpose(rej_col.sum(axis=0)).astype(np.int16)
 
         q=(mask==0)
         if np.sum(q)==0:
@@ -1739,6 +2055,32 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
     hdu_m.writeto(fnlist.replace('.list','_m'+suffix_all+'.fits'),overwrite=True)
     hdu_e=fits.PrimaryHDU(edata_3d.T,header=ehdr0)
     hdu_e.writeto(fnlist.replace('.list','_e'+suffix_all+'.fits'),overwrite=True)
+
+    if crr_split:
+        chdr = mhdr0.copy()
+        chdr['COMMENT'] = 'number of frames rejected per voxel (crr_split)'
+        chdr['CRRMODE'] = (str(crr_split_mode) if isinstance(crr_split_mode, str) else 'custom',
+                           'crr_split comparison mode')
+        chdr['CRRNSIG'] = (crr_nsig, 'absolute threshold [sigma]')
+        chdr['CRRREL'] = (crr_rel, 'relative threshold [local level]')
+        chdr['CRRWIN'] = (crr_window, 'local-level window, spatial [pix]')
+        chdr['CRRZWIN'] = (crr_zwindow, 'local-level window, spectral [pix]')
+        chdr['CRRZMED'] = (crr_zmed, 'spectral median high-pass [pix]')
+        chdr['CRRGRXY'] = (crr_grow_xy, 'max spatial growth [pix]')
+        chdr['CRRGRZ'] = (crr_grow_z, 'max spectral growth [pix]')
+        chdr['CRRGRSIG'] = (crr_grow_nsig, 'growth threshold [sigma]')
+        chdr['CRRPADXY'] = (crr_pad_xy, 'unconditional spatial pad [pix]')
+        hdu_c0 = fits.PrimaryHDU(crr_nrej_3d.T, header=chdr)
+        tab_c = fits.BinTableHDU(table.Table([[os.path.basename(f) for f in fn], crr_groups,
+                                              crr_nrej_frame],
+                                             names=['file', 'group', 'n_rejected']), name='FRAMES')
+        hdul_c = fits.HDUList([hdu_c0, tab_c])
+        if crr_save_files:
+            mhdr = mhdr0.copy()
+            mhdr['EXTNAME'] = 'FRAMEREJ'
+            mhdr['COMMENT'] = 'per-frame rejection mask, axis 4 = frame (see FRAMES table)'
+            hdul_c.append(fits.ImageHDU(crr_rej.astype(np.uint8), header=mhdr))
+        hdul_c.writeto('kcwi_stack/' + fnlist.replace('.list', '.crrsplit.fits'), overwrite=True)
 
     if use_astrom:
         # wavelength range

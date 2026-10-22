@@ -2,7 +2,7 @@
 
 """
 kcwi_automask.py -- make KCWI/KCRM masks automatically instead of drawing them
-by hand in DS9. Two modes:
+by hand in DS9. Many modes:
 
 INTF MODE (sky mask for the DRP, <base>_intf.fits -> <base>.reg -> <base>_smsk.fits)
     In an _intf frame every slice is a vertical strip with wavelength along y, so
@@ -36,6 +36,29 @@ THUM MODE (mask for median filtering, <base>_icube.thum.fits ->
     dropped (--edge), and no slice is allowed to be masked by more than --maxfrac
     of its length, with the weakest sources dropped first when it would be.
 
+BCRMSK MODE (astroscrappy protection mask for the DRP, <base>_intf.fits ->
+             <base>_bcrmsk.reg -> <base>_intf_bcrmsk.fits)
+    KCWI_DRP's RemoveCosmicRays hands <base>_intf_bcrmsk.fits to astroscrappy as
+    `inmask`, the pixels detect_cosmics must ignore. A bright quasar is exactly
+    what its Laplacian filter is built to find -- narrow and steep -- so parts
+    of the object get "cleaned" away. Measured against the DRP's own flags on
+    eight 600 s frames, astroscrappy's rate rises from 0.08% of pixels at sky
+    level to 1.4% above 2500 counts, a rate that should not depend on
+    brightness at all: about 150 object pixels destroyed per frame.
+    The sky mask has to over-cover, because source flux left in it biases the
+    sky model. This one has to under-cover: inside it a real cosmic ray now
+    survives, to be caught later by crr_split in kcwi_stack or by a crmsk. So
+    it masks the bright spots themselves rather than whole traces -- the sky
+    spectrum is subtracted per slice, a short running median along wavelength
+    (--bcr-zmed) removes anything narrower than the resolution, so a cosmic ray
+    the DRP missed on the first pass cannot be protected on the second, and
+    what is left above --bcr-thresh counts is masked. On those eight frames
+    that covered 80% of the false flags with 0.83% of the frame, against 76%
+    and 2.51% for full-height strips (--bcr-mode strips), and gave up three
+    times fewer real cosmic rays -- better on both counts. Needs an _intf
+    frame, so this is a second-pass product: reduce once, build the masks, set
+    bcrmsk in kcwi_blue.cfg, reduce again.
+
 WL MODE (source mask for KSkyWizard/ZAP, <base>_wlimg.fits -> <base>.reg
          -> <base>_zap_mask.fits)
     The white-light image KSkyWizard writes beside each frame, detected the same
@@ -55,7 +78,7 @@ WL MODE (source mask for KSkyWizard/ZAP, <base>_wlimg.fits -> <base>.reg
     throwing away real sources a row or two inside the field, at the cost of the
     occasional two-pixel blip in a corner, which --edge 1 suppresses.
 
-All three modes write a DS9 region file, following the naming
+All four modes write a DS9 region file, following the naming
 that kcwi_makemask / kcwi_makemask_medfilter expect, so you can check and edit
 in DS9 and then convert as usual:
 
@@ -72,6 +95,10 @@ Options:
                   processes every file instead.
     --wl          white-light mode: write the KSkyWizard region file <base>.reg
                   from <base>_wlimg.fits (ellipses, physical coordinates).
+    --bcrmsk      astroscrappy protection mask: <base>_intf_bcrmsk.fits (and
+                  <base>_bcrmsk.reg) from <base>_intf.fits. The FITS is written
+                  by default here, because it is what the DRP reads. Tune the
+                  cosmic-ray cost with --bcr-thresh: higher masks less.
     --convert     do not detect anything: build the mask FITS from the region
                   file that is already there. This is the mode to use after
                   hand-editing a .reg in DS9 -- the region file is only read.
@@ -86,6 +113,8 @@ Examples:
     kcwi_automask.py kb261007_00086_intf.fits --convert     # after editing the .reg
     kcwi_automask.py --json red.json --thum --all --convert # one .reg per group
     kcwi_automask.py kb*_intf.fits --plot
+    kcwi_automask.py --json red.json --bcrmsk --plot    # then re-run the DRP
+    kcwi_automask.py kb261007_00086_intf.fits --bcrmsk --convert
     kcwi_automask.py --json blue.json --plot --smsk
     kcwi_automask.py --json red.json --thum --grow 1 --maxfrac 0.25 --plot
 """
@@ -347,7 +376,7 @@ def detect_slice(sub, nsig=8., grow_nsig=3., grow=1, bkg_window=11., min_frac_va
 
 
 def trace_boxes(sub, cores, x0, ny_full, ybin=100, wing_nsig=3., seed_nsig=5.,
-                maxfrac=0.5, far_pad=8):
+                maxfrac=0.5, far_pad=10):
     """Follow a trace's width as a function of wavelength.
 
     A bright QSO scatters light along the slice, and the amount scattered tracks
@@ -470,7 +499,8 @@ def trace_boxes(sub, cores, x0, ny_full, ybin=100, wing_nsig=3., seed_nsig=5.,
 
 def automask_intf(imfname, nsig=8., grow_nsig=3., grow=1, maxfrac=0.5, bkg_window=11.,
                   edge_trim=2, adaptive=True, ybin=200, wing_nsig=3., seed_nsig=5., bright_nsig=50.,
-                  bright_reach=3, regfn=None, write_mask=False, plot=False, verbose=True):
+                  bright_reach=3, regfn=None, write_mask=False, mask_out=None, plot=False,
+                  verbose=True):
     """Detect object traces in an _intf frame and write the sky mask.
 
     Args:
@@ -496,7 +526,8 @@ def automask_intf(imfname, nsig=8., grow_nsig=3., grow=1, maxfrac=0.5, bkg_windo
             masks where it carries signal above wing_nsig.
         regfn (str): output region file. Default <base>.reg, which is what
             kcwi_makemask expects next to <base>_intf.fits.
-        write_mask (bool): also write <base>_smsk.fits (uint8, 1 = masked).
+        write_mask (bool): also write the mask FITS (uint8, 1 = masked).
+        mask_out (str): where that mask goes. Default <base>_smsk.fits.
         plot (bool): write a quick-look PNG.
 
     Returns:
@@ -578,10 +609,14 @@ def automask_intf(imfname, nsig=8., grow_nsig=3., grow=1, maxfrac=0.5, bkg_windo
 
     if regfn is None:
         regfn = imfname.replace('_intf.fits', '.reg')
+    if mask_out is None:
+        mask_out = imfname.replace('_intf', '_smsk')
     frac = mask.mean()
 
     if plot:
-        _plot_intf(imfname, data, slices, boxes, snr_all, nsig, verbose=verbose)
+        _plot_intf(imfname, data, slices, boxes, snr_all, nsig, verbose=verbose,
+                   pngfn=(imfname.replace('_intf.fits', '_bcrmsk.png')
+                          if mask_out and mask_out.endswith('_bcrmsk.fits') else None))
 
     if len(boxes) == 0:
         # an empty region file makes kcwi_masksky_ds9.py fail (it builds no mask),
@@ -590,8 +625,7 @@ def automask_intf(imfname, nsig=8., grow_nsig=3., grow=1, maxfrac=0.5, bkg_windo
             print('  nothing detected: no region file written '
                   '(lower --nsig if a source is expected)')
         if write_mask:
-            fits.PrimaryHDU(np.uint8(mask)).writeto(
-                imfname.replace('_intf', '_smsk'), overwrite=True)
+            fits.PrimaryHDU(np.uint8(mask)).writeto(mask_out, overwrite=True)
         return None, 0, 0.
 
     lines = ['box({:.1f},{:.1f},{:d},{:d},0)'.format(
@@ -603,7 +637,7 @@ def automask_intf(imfname, nsig=8., grow_nsig=3., grow=1, maxfrac=0.5, bkg_windo
             len(boxes), frac, os.path.basename(regfn)))
 
     if write_mask:
-        outfile = imfname.replace('_intf', '_smsk')
+        outfile = mask_out
         fits.PrimaryHDU(np.uint8(mask)).writeto(outfile, overwrite=True)
         if verbose:
             print('  wrote {}'.format(os.path.basename(outfile)))
@@ -687,7 +721,7 @@ def _cover_with_ellipses(grown, snr, max_radius=6.):
 
 
 
-def _footprint_polygons(grown, simplify=0.0):
+def _footprint_polygons(grown, simplify=0.0, fill_holes=True):
     """Trace a footprint's outline as DS9 polygons (0-based vertices).
 
     An ellipse has to be inflated to cover the corners of what it encloses -- on
@@ -695,23 +729,50 @@ def _footprint_polygons(grown, simplify=0.0):
     median filter then has to interpolate over. A polygon follows the detected
     pixels instead.
 
+    Two things about the contour tracer matter here. Matplotlib (>= 3.8) returns
+    ONE compound Path per level, holding every ring as a separate subpath, so
+    reading `.vertices` straight off it concatenates the rings: two disjoint
+    blobs, or a blob and the hole inside it, come back as a single polygon whose
+    outline jumps between them. DS9 has no hole syntax and no multi-part
+    polygon, so each ring has to be split out at its MOVETO and written on its
+    own. Holes are filled first, which both removes the ambiguity (every
+    remaining ring is an outer boundary) and is what you want anyway -- an
+    unmasked pixel in the middle of a source is not useful to ZAP.
+
     Args:
         grown (bool ndarray): the footprint, [ny, nx].
         simplify (float): drop vertices that lie within this distance of the
             segment between their neighbours [pixels]. 0 keeps every vertex.
+        fill_holes (bool): fill interior holes before tracing.
 
     Returns:
-        list of ndarray [(n, 2)]: polygon vertices (x, y), 0-based.
+        list of ndarray [(n, 2)]: polygon vertices (x, y), 0-based. One entry
+        per connected blob.
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib.path import Path as _MplPath
+    if fill_holes:
+        grown = ndimage.binary_fill_holes(grown)
     fig = plt.figure()
     try:
         cs = plt.contour(grown.astype(float), levels=[0.5])
-        segs = [np.asarray(p.vertices) for coll in [cs] for p in
-                (cs.get_paths() if hasattr(cs, 'get_paths') else
-                 [pp for c in cs.collections for pp in c.get_paths()])]
+        paths = (cs.get_paths() if hasattr(cs, 'get_paths') else
+                 [pp for c in cs.collections for pp in c.get_paths()])
+        segs = []
+        for p in paths:
+            v = np.asarray(p.vertices)
+            codes = getattr(p, 'codes', None)
+            if codes is None:
+                segs.append(v)
+                continue
+            starts = np.flatnonzero(np.asarray(codes) == _MplPath.MOVETO)
+            if len(starts) == 0:
+                segs.append(v)
+                continue
+            for a, b in zip(starts, list(starts[1:]) + [len(v)]):
+                segs.append(v[a:b])
     finally:
         plt.close(fig)
     out = []
@@ -730,6 +791,158 @@ def _footprint_polygons(grown, simplify=0.0):
         out.append(v)
     return out
 
+
+def automask_bcrmsk(imfname, mode='spots', thresh=250., nsig=5., zmed=5, grow=1,
+                    edge_trim=2, minpix=4, regfn=None, mask_out=None, write_mask=True,
+                    plot=False, verbose=True, **strip_kw):
+    """Make the astroscrappy protection mask for the DRP from an _intf frame.
+
+    KCWI_DRP's RemoveCosmicRays passes <base>_intf_bcrmsk.fits to astroscrappy as
+    `inmask`, the pixels detect_cosmics is to ignore. On a bright source
+    astroscrappy misfires: the core is narrow and steep in exactly the way its
+    Laplacian filter looks for, so parts of the object are "cleaned" away.
+    Measured against the DRP's own flags on eight 600 s frames of a bright
+    quasar, its flagging rate rises from 0.08% of pixels at sky level to 1.4%
+    above 2500 counts -- a seventeen-fold excess over a rate that should not
+    depend on brightness at all, i.e. about 150 object pixels destroyed per
+    frame.
+
+    Every pixel inside this mask is also a pixel where a real cosmic ray now
+    survives, to be caught later by the per-frame rejection in kcwi_stack
+    (crr_split) or by a crmsk, so the mask wants to be as small as it can be
+    while still covering the pixels bright enough to be at risk. Since the risk
+    tracks brightness, the default is to mask the bright spots themselves
+    rather than whole traces:
+
+        1. each slice's sky spectrum (the median across its columns at every
+           wavelength) is subtracted, leaving the object;
+        2. a short running median along wavelength (zmed) removes anything
+           narrower than the instrumental resolution, so that a cosmic ray the
+           DRP missed on the first pass cannot be protected on the second;
+        3. what is left above `thresh` counts (and above nsig x the local
+           scatter) is masked, grown by `grow` pixels.
+
+    On those eight frames this covers 80% of the false flags with 0.83% of the
+    frame masked, against 76% and 2.51% for full-height strips (mode='strips'),
+    and gives up 3x fewer real cosmic rays -- better on both counts.
+
+    Needs an _intf frame, so run the DRP once, build the masks, set
+    `bcrmsk = True` in kcwi_blue.cfg and run it again.
+
+    Args:
+        imfname (str): the _intf.fits frame.
+        mode (str): 'spots' (the default, above) or 'strips' for the
+            full-height traces of the sky mask, tightened; 'strips' takes the
+            automask_intf keywords through **strip_kw.
+        thresh (float): counts above the slice's sky spectrum at which a pixel
+            is worth protecting. 250 is where the measured flagging rate first
+            runs away; it is an absolute level, so scale it if your exposures
+            or binning differ a lot from 600-990 s at 2x2. Higher is safer for
+            cosmic rays and covers less of the object: 1000 gives 53% coverage
+            for a third of the losses, 150 gives 83% for a quarter more.
+        nsig (float): the pixel must also be this far above the local scatter,
+            so a short exposure is not over-masked.
+        zmed (int): running median along wavelength [pixels]. Must be wider
+            than a cosmic ray and narrower than a real spectral feature.
+        grow (int): pixels of growth around each spot.
+        minpix (int): smallest spot kept.
+        regfn (str): region file. Default <base>_bcrmsk.reg -- deliberately not
+            <base>.reg, which is the sky mask's.
+        mask_out (str): FITS mask. Default <base>_intf_bcrmsk.fits, the name
+            RemoveCosmicRays looks for.
+        write_mask (bool): write that FITS. On by default: unlike the sky mask,
+            the FITS is what the DRP actually reads.
+
+    Returns:
+        (regfn, nboxes, frac)
+    """
+    base = imfname[:-len('_intf.fits')] if imfname.endswith('_intf.fits') \
+        else imfname.replace('.fits', '')
+    regfn = regfn or (base + '_bcrmsk.reg')
+    mask_out = mask_out or (base + '_intf_bcrmsk.fits')
+    if mode == 'strips':
+        kw = dict(nsig=20., grow_nsig=10., grow=0, maxfrac=0.25, ybin=100,
+                  wing_nsig=10., seed_nsig=15., bright_nsig=100., bright_reach=0)
+        kw.update(strip_kw)
+        return automask_intf(imfname, edge_trim=edge_trim, adaptive=True,
+                             regfn=regfn, write_mask=write_mask, mask_out=mask_out,
+                             plot=plot, verbose=verbose, **kw)
+    if mode != 'spots':
+        raise ValueError("mode must be 'spots' or 'strips'")
+
+    data = fits.getdata(imfname)
+    if data.ndim != 2:
+        raise ValueError('{} is not a 2D _intf image'.format(imfname))
+    ny, nx = data.shape
+    slices = find_slices(data, edge_trim=edge_trim)
+    if verbose:
+        print('{}: {} x {}, {} slices'.format(os.path.basename(imfname), nx, ny, len(slices)))
+    mask = np.zeros((ny, nx), dtype=bool)
+    for (x0, x1) in slices:
+        sub = data[:, x0:x1].astype(float)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            resid = sub - np.nanmedian(sub, axis=1)[:, None]      # drop the sky spectrum
+            if zmed and zmed > 1:
+                # anything narrower than this is a cosmic ray, not the object
+                resid = ndimage.median_filter(resid, size=(int(zmed), 1), mode='nearest')
+            sig = _robust_sigma(resid[np.isfinite(resid)])
+        lim = thresh
+        if np.isfinite(sig) and sig > 0:
+            lim = max(thresh, nsig * sig)
+        f = np.isfinite(resid) & (resid > lim)
+        if grow > 0:
+            f = ndimage.binary_dilation(f, np.ones((3, 3), bool), iterations=int(grow))
+        mask[:, x0:x1] = f
+
+    lab, n = ndimage.label(mask, structure=np.ones((3, 3), bool))
+    polys = []
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None:
+            continue
+        pix = lab[sl] == i
+        if int(pix.sum()) < minpix:
+            mask[sl] &= ~pix
+            continue
+        # the exact pixel footprint, not its bounding box: a box around a thin
+        # diagonal spot covers far more than was detected, and the region file
+        # has to rebuild the same mask when --convert reads it back
+        y0, x0 = sl[0].start, sl[1].start
+        # pad, or a footprint that fills its bounding box has no 0.5 crossing
+        # for the contour tracer to follow and comes back empty
+        got = _footprint_polygons(np.pad(pix, 1))
+        if got:
+            for v in got:
+                polys.append([(x + x0 - 1, y + y0 - 1) for (x, y) in v])
+        else:
+            ys, xs = np.where(pix)
+            polys.append([(xs.min() + x0 - 0.5, ys.min() + y0 - 0.5),
+                          (xs.max() + x0 + 0.5, ys.min() + y0 - 0.5),
+                          (xs.max() + x0 + 0.5, ys.max() + y0 + 0.5),
+                          (xs.min() + x0 - 0.5, ys.max() + y0 + 0.5)])
+    frac = mask.mean()
+
+    if plot:
+        _plot_spots(imfname, data, slices, mask, thresh, verbose=verbose)
+
+    if len(polys) == 0:
+        if verbose:
+            print('  nothing above {:g} counts: no region file written'.format(thresh))
+        if write_mask:
+            fits.PrimaryHDU(np.uint8(mask)).writeto(mask_out, overwrite=True)
+        return None, 0, 0.
+
+    lines = ['polygon(' + ','.join('{:.2f}'.format(c + 1) for xy in v for c in xy) + ')'
+             for v in polys]
+    _write_regions(regfn, lines, os.path.basename(imfname))
+    if verbose:
+        print('  {} spot(s) above {:g} counts, {:.2%} of the frame masked -> {}'.format(
+            len(polys), thresh, frac, os.path.basename(regfn)))
+    if write_mask:
+        fits.PrimaryHDU(np.uint8(mask)).writeto(mask_out, overwrite=True)
+        if verbose:
+            print('  wrote {}'.format(os.path.basename(mask_out)))
+    return regfn, len(polys), frac
 
 def automask_thum(imfname, nsig=4., grow=1, grow_nsig=2., minpix=2, maxfrac=0.4,
                   edge=2, max_radius=6., shape='polygon', regfn=None, write_mask=False,
@@ -853,6 +1066,16 @@ def automask_thum(imfname, nsig=4., grow=1, grow_nsig=2., minpix=2, maxfrac=0.4,
             for v in polys:
                 em |= Path(v).contains_points(pts).reshape(ny, nx)
             em = (em | grown) & cover
+            # An accepted detection is masked as a solid shape. `cover` drops
+            # pixels KSkyWizard calls edge (mean FLAGS > edge_var), and on a
+            # bright source the core is exactly where the flags are raised --
+            # on a real Q1700-QSO frame four pixels beside the peak sat at
+            # 1.1-1.9 and were dropped, leaving a hole through the middle of
+            # the QSO in the mask, the per-slice budget and the written
+            # _zap_mask.fits while the region polygon covered it. Filling
+            # interior holes closes that without pushing the outer boundary
+            # into the edge region.
+            em = ndimage.binary_fill_holes(em)
             o['polys'] = polys
             o['ell'] = (float(np.mean([v[:, 0].mean() for v in polys])) if polys else 0.,
                         float(np.mean([v[:, 1].mean() for v in polys])) if polys else 0.,
@@ -867,6 +1090,7 @@ def automask_thum(imfname, nsig=4., grow=1, grow_nsig=2., minpix=2, maxfrac=0.4,
                 vg = -(xx_g - cx) * np.sin(th) + (yy_g - cy) * np.cos(th)
                 em |= ((ug / aa)**2 + (vg / bb)**2 <= 1.0)
             em &= cover
+            em = ndimage.binary_fill_holes(em)   # see the note in the polygon branch
             o['ells'] = ells
             o['polys'] = []
             o['ell'] = ells[0] if ells else (0., 0., 0., 0., 0.)
@@ -1015,7 +1239,9 @@ def convert_region(imfname, regfn=None, thum=None, kind=None, edge_var=1.,
         regfn (str): the region file. Default: <base>.reg for an _intf frame,
             or the image name with .fits -> .reg for a thumbnail.
         thum (bool): thumbnail mode; inferred from the file name when None.
-        kind (str): 'intf', 'thum' or 'wl'; inferred from the file name when None.
+        kind (str): 'intf', 'thum', 'wl' or 'bcrmsk'; inferred from the file name
+            when None ('bcrmsk' never is -- pass it explicitly, or use
+            --bcrmsk --convert).
         edge_var (float): for 'wl', the second-extension value above which a
             pixel is edge, as in KSkyWizard.
 
@@ -1031,6 +1257,7 @@ def convert_region(imfname, regfn=None, thum=None, kind=None, edge_var=1.,
     if regfn is None:
         regfn = (imfname.replace('_wlimg.fits', '.reg') if kind == 'wl' else
                  imfname.replace('.fits', '.reg') if kind == 'thum' else
+                 imfname.replace('_intf.fits', '_bcrmsk.reg') if kind == 'bcrmsk' else
                  imfname.replace('_intf.fits', '.reg'))
     if not os.path.exists(regfn):
         if verbose:
@@ -1051,6 +1278,10 @@ def convert_region(imfname, regfn=None, thum=None, kind=None, edge_var=1.,
     elif kind == 'thum':
         outfile = imfname.replace('thum', 'mask')
         out = np.uint8(mask)
+    elif kind == 'bcrmsk':
+        # RemoveCosmicRays tests `bcrinmask == 1`, so anything else is unmasked
+        outfile = imfname.replace('_intf.fits', '_intf_bcrmsk.fits')
+        out = np.uint8(mask)
     else:
         outfile = imfname.replace('_intf', '_smsk')
         out = np.uint8(mask)
@@ -1069,7 +1300,7 @@ def convert_region(imfname, regfn=None, thum=None, kind=None, edge_var=1.,
 
 
 def automask_wl(imfname, edge_var=1., min_usable=0.2, trim_nsig=5., nsig=4.,
-                shape='ellipse', max_radius=10., grow_nsig=3., maxfrac=1.0,
+                shape='polygon', max_radius=10., grow_nsig=3., maxfrac=1.0,
                 edge=0, write_mask=False, regfn=None, verbose=True, **kw):
     """Make the KSkyWizard region file from a white-light image.
 
@@ -1077,8 +1308,9 @@ def automask_wl(imfname, edge_var=1., min_usable=0.2, trim_nsig=5., nsig=4.,
     source regions by hand and save them as <prefix>_<index>.reg beside it; it
     then builds the ZAP mask with pyregion, marking its own edge pixels (where
     the second extension exceeds `edge_var`) as 1 and the region pixels as 2.
-    This writes that region file automatically, in physical coordinates and with
-    ellipses, matching what the GUI expects.
+    This writes that region file automatically, in physical coordinates, as
+    polygons that follow the detected pixels (pass shape='ellipse' for the
+    rounded shapes the GUI itself writes).
 
     Detection is the same as in thumbnail mode, except that the usable area
     comes from KSkyWizard's own edge criterion, which keeps the detector edges
@@ -1108,9 +1340,16 @@ def automask_wl(imfname, edge_var=1., min_usable=0.2, trim_nsig=5., nsig=4.,
         nsig (float): detection threshold. On a real frame the three obvious
             sources came out at 25-59 sigma and two faint ones that had been
             masked by hand at 3.3-3.8, so use --nsig 3 to catch those.
-        shape (str): 'ellipse' (what the GUI's own files use) or 'polygon'.
+        shape (str): 'polygon' (the default) or 'ellipse'. Polygons follow the
+            detected pixels; on three real Q1700-QSO white-light frames they
+            masked 8.4/7.6/7.8% of the field against 13.4/12.3/12.6% for
+            ellipses, for the same detections -- an ellipse has to be inflated
+            to cover the corners of what it encloses, and an elongated source
+            gets tiled into several overlapping ellipses on top of that. Use
+            'ellipse' to match what the KSkyWizard GUI writes by hand.
         max_radius (float): largest semi-axis of one ellipse [pixels]; 10 suits
             the white-light grid, where 6 split each source into many tiles.
+            Ignored when shape='polygon'.
         grow_nsig (float): growth threshold; 3 keeps neighbouring sources from
             bridging into one long chain, which 2 did on a real frame.
         write_mask (bool): also write <base>_zap_mask.fits in KSkyWizard's
@@ -1170,7 +1409,7 @@ def _zscale(img, contrast=0.25):
     return med - (med - lo) / contrast * 0.25, med + (hi - med) / contrast * 0.25
 
 
-def _plot_intf(imfname, data, slices, boxes, snr, nsig, verbose=True):
+def _plot_intf(imfname, data, slices, boxes, snr, nsig, verbose=True, pngfn=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1198,8 +1437,38 @@ def _plot_intf(imfname, data, slices, boxes, snr, nsig, verbose=True):
     axs[1].set_xlabel('x [pix]')
     axs[1].set_ylabel('column S/N')
     axs[1].legend(fontsize=8, loc='upper right')
-    pngfn = imfname.replace('_intf.fits', '_automask.png')
+    pngfn = pngfn or imfname.replace('_intf.fits', '_automask.png')
     fig.savefig(pngfn, dpi=110, bbox_inches='tight')
+    plt.close(fig)
+    if verbose:
+        print('  plot -> {}'.format(os.path.basename(pngfn)))
+
+
+def _plot_spots(imfname, data, slices, mask, thresh, verbose=True):
+    """Quick look at the astroscrappy protection mask: frame plus what is covered."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    ny, nx = data.shape
+    fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
+                           gridspec_kw={'height_ratios': [4, 1]})
+    lo, hi = _zscale(data)
+    ax[0].imshow(data, origin='lower', cmap='Greys_r', vmin=lo, vmax=hi,
+                 aspect='auto', interpolation='nearest')
+    if mask.any():
+        ax[0].contour(mask.astype(float), levels=[0.5], colors=['#c1666b'], linewidths=0.6)
+    ax[0].set_ylabel('wavelength [pix]')
+    ax[0].set_title('{} -- {:.2%} masked above {:g} counts'.format(
+        os.path.basename(imfname), mask.mean(), thresh))
+    ax[1].plot(np.arange(nx), 100. * mask.mean(axis=0), color='#1b4965', lw=0.8)
+    for (x0, x1) in slices:
+        ax[1].axvspan(x0, x1, color='0.93', zorder=0)
+    ax[1].set_xlabel('x [pix]')
+    ax[1].set_ylabel('% of column\nmasked')
+    ax[1].set_xlim(0, nx)
+    fig.tight_layout()
+    pngfn = imfname.replace('_intf.fits', '_bcrmsk.png')
+    fig.savefig(pngfn, dpi=120)
     plt.close(fig)
     if verbose:
         print('  plot -> {}'.format(os.path.basename(pngfn)))
@@ -1212,21 +1481,36 @@ def _plot_thum(imfname, data, snr, mask, objs, skipped, nsig, maxfrac, verbose=T
     import matplotlib.pyplot as plt
 
     ny, nx = data.shape
+    # equal aspect: these frames are tall and narrow (34 x 96 on the white-light
+    # grid) and stretching them to fill a square axes made a source that is
+    # elongated along the slice look round, which is not what ds9 shows
     fig, axs = plt.subplots(1, 3, figsize=(11, 5),
-                            gridspec_kw={'width_ratios': [1, 1, 1.1]})
+                            gridspec_kw={'width_ratios': [1, 1, 1.4]})
     vmin, vmax = _zscale(data)
     axs[0].imshow(data, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
-                  aspect='auto', interpolation='nearest')
+                  aspect='equal', interpolation='nearest')
     axs[0].set_title('thumbnail', fontsize=9)
     axs[1].imshow(snr, origin='lower', cmap='gray', vmin=-2, vmax=max(5, nsig * 3),
-                  aspect='auto', interpolation='nearest')
-    axs[1].contour(mask.astype(float), levels=[0.5], colors='red', linewidths=0.8)
-    from matplotlib.patches import Ellipse
+                  aspect='equal', interpolation='nearest')
+    from matplotlib.patches import Ellipse, Polygon
+    # Draw the shapes that go into the region file, not a contour of the
+    # rasterised mask: the contour follows pixel edges and reports any hole in
+    # the mask as a second closed loop, which is what made a small ring appear
+    # in the middle of the QSO.
+    for o in objs:
+        for v in o.get('polys', []):
+            axs[1].add_patch(Polygon(v, closed=True, fill=False, ec='red', lw=0.9))
+        for (xc, yc, aa, bb, ang) in o.get('ells', []):
+            axs[1].add_patch(Ellipse((xc, yc), 2 * aa, 2 * bb, angle=ang,
+                                     fill=False, ec='red', lw=0.9))
     for o in skipped:
-        xc, yc, aa, bb, ang = o['ell']
-        axs[1].add_patch(Ellipse((xc, yc), 2 * aa, 2 * bb, angle=ang, fill=False,
-                                 ec='cyan', ls='--', lw=0.9))
-    axs[1].set_title('de-striped S/N: {} masked{}'.format(
+        for v in o.get('polys', []):
+            axs[1].add_patch(Polygon(v, closed=True, fill=False, ec='cyan',
+                                     ls='--', lw=0.9))
+        for (xc, yc, aa, bb, ang) in o.get('ells', []):
+            axs[1].add_patch(Ellipse((xc, yc), 2 * aa, 2 * bb, angle=ang,
+                                     fill=False, ec='cyan', ls='--', lw=0.9))
+    axs[1].set_title('de-striped S/N: {} source(s) masked{}'.format(
         len(objs), ', {} skipped (cyan)'.format(len(skipped)) if skipped else ''), fontsize=9)
     frac = mask.sum(axis=0) / float(ny)
     axs[2].bar(np.arange(nx), frac, color='C0')
@@ -1239,7 +1523,9 @@ def _plot_thum(imfname, data, snr, mask, objs, skipped, nsig, maxfrac, verbose=T
                            frac.max() * 1.2 if frac.max() > 0 else 0.1))
     if maxfrac < 1.:
         axs[2].legend(fontsize=8)
-    axs[2].set_title('per-slice budget', fontsize=9)
+    axs[2].set_title('per-slice budget' if maxfrac < 1. else
+                     'masked fraction per slice (no budget)', fontsize=9)
+    axs[2].set_box_aspect(1.6)
     fig.suptitle(label or os.path.basename(imfname), fontsize=10)
     fig.tight_layout()
     pngfn = pngfn or imfname.replace('.fits', '_automask.png')
@@ -1253,24 +1539,24 @@ def _plot_thum(imfname, data, snr, mask, objs, skipped, nsig, maxfrac, verbose=T
 # frame lists
 # --------------------------------------------------------------------------
 
-def frames_from_json(jsonfn, thum=False, wl=False, allfiles=False, verbose=True,
-                     with_ref=False):
+def frames_from_json(jsonfn, thum=False, wl=False, allfiles=False, verbose=True):
     """Build the list of frames from a grouping JSON, as the open_ds9 scripts do.
+
+    The JSON only ever selects which exposures to work on here. Each frame is
+    treated on its own, so every one gets its own region file; applying one
+    group's region file to the whole group is what kcwi_makemask_medfilter is
+    for, and duplicating it here just gave two ways to do the same thing.
 
     Args:
         jsonfn (str): {group: [raw file names]} as written by kcrm_group_frames.
         thum (bool): return <base>_icube.thum.fits instead of <base>_intf.fits.
         wl (bool): return <base>_wlimg.fits (KSkyWizard white-light images).
-        allfiles (bool): every file of each group; default is the first only,
-            which is the frame the region file is drawn on.
-
-        with_ref (bool): return (file, reference file of its group) pairs. The
-            reference is the first file of the group, which is the frame the
-            region file was drawn on -- that is how kcwi_makemask_medfilter
-            applies one region file to every frame of a group.
+        allfiles (bool): every exposure listed in the JSON. The default is the
+            first file of each group, which is the frame the region file is
+            conventionally drawn on.
 
     Returns:
-        list of str, or of (str, str) when with_ref is set.
+        list of str.
     """
     with open(jsonfn, 'r') as f:
         groups = json.load(f)
@@ -1279,13 +1565,11 @@ def frames_from_json(jsonfn, thum=False, wl=False, allfiles=False, verbose=True,
     for group, files in groups.items():
         if not files:
             continue
-        stem0 = files[0][:-5] if files[0].endswith('.fits') else files[0]
-        ref = stem0 + suffix
         for fn in (files if allfiles else files[:1]):
             stem = fn[:-5] if fn.endswith('.fits') else fn
             cand = stem + suffix
             if os.path.exists(cand):
-                out.append((cand, ref) if with_ref else cand)
+                out.append(cand)
             elif verbose:
                 print('{} not found (group {})'.format(cand, group))
     return out
@@ -1302,9 +1586,19 @@ def parser_init():
     p.add_argument('-j', '--json', default=None,
                    help='grouping JSON; uses the first file of each group')
     p.add_argument('-a', '--all', action='store_true',
-                   help='with --json, process every file of each group')
+                   help='with --json, process every exposure listed rather than only '
+                        'the first file of each group; each frame is treated on its '
+                        'own, so it gets its own region file and its own mask')
+    # --per-frame / --ungroup were a separate flag for one release; --all now
+    # does exactly that, so they are kept working but out of the help
+    p.add_argument('--per-frame', '--ungroup', dest='all', action='store_true',
+                   help=argparse.SUPPRESS)
     p.add_argument('-t', '--thum', action='store_true',
                    help='thumbnail mode (median-filter mask); implied by a *thum*.fits name')
+    p.add_argument('-b', '--bcrmsk', action='store_true',
+                   help="astroscrappy protection mask: write <base>_intf_bcrmsk.fits "
+                        "(and <base>_bcrmsk.reg) from <base>_intf.fits, the inmask "
+                        "KCWI_DRP's RemoveCosmicRays passes to detect_cosmics")
     p.add_argument('-w', '--wl', action='store_true',
                    help='white-light mode: write the KSkyWizard region file <base>.reg '
                         'from <base>_wlimg.fits; implied by a *_wlimg.fits name')
@@ -1314,6 +1608,14 @@ def parser_init():
     p.add_argument('--edge-var', type=float, default=1.,
                    help='wl: second-extension value above which a pixel counts as edge, '
                         "as in KSkyWizard's own edgemask")
+    p.add_argument('--bcr-mode', choices=['spots', 'strips'], default='spots',
+                   help='bcrmsk: mask the bright spots (default) or full-height traces')
+    p.add_argument('--bcr-thresh', type=float, default=250.,
+                   help='bcrmsk spots: counts above the slice sky at which a pixel is '
+                        'protected (higher = fewer real cosmic rays given up)')
+    p.add_argument('--bcr-zmed', type=int, default=5,
+                   help='bcrmsk spots: running median along wavelength [pix], wider than '
+                        'a cosmic ray and narrower than a real feature')
     p.add_argument('--trim-nsig', type=float, default=5.,
                    help='wl: how far off the interior level a boundary row has to be '
                         'to be dropped as illumination ramp')
@@ -1326,17 +1628,21 @@ def parser_init():
     p.add_argument('--rect', action='store_true',
                    help='intf: full-height rectangles instead of a mask whose width '
                         'follows the brightness with wavelength')
-    p.add_argument('--ybin', type=int, default=200,
-                   help='intf: rows per wavelength bin for the adaptive width')
-    p.add_argument('--wing-nsig', type=float, default=3.,
-                   help='intf: threshold for extending the mask sideways [sigma]')
-    p.add_argument('--seed-nsig', type=float, default=5.,
-                   help='intf: threshold a seeded position must reach to be masked')
-    p.add_argument('--bright-nsig', type=float, default=50.,
+    p.add_argument('--ybin', type=int, default=None,
+                   help='intf: rows per wavelength bin for the adaptive width '
+                        '(default 200; 100 for --bcrmsk)')
+    p.add_argument('--wing-nsig', type=float, default=None,
+                   help='intf: threshold for extending the mask sideways [sigma] '
+                        '(default 3; 10 for --bcrmsk)')
+    p.add_argument('--seed-nsig', type=float, default=None,
+                   help='intf: threshold a seeded position must reach to be masked '
+                        '(default 5; 15 for --bcrmsk)')
+    p.add_argument('--bright-nsig', type=float, default=None,
                    help='intf: a trace above this seeds neighbouring slices, where its '
                         'scattered light leaks')
-    p.add_argument('--bright-reach', type=int, default=3,
-                   help='intf: how many slices away a seed is carried (0 disables)')
+    p.add_argument('--bright-reach', type=int, default=None,
+                   help='intf: how many slices away a seed is carried (0 disables; '
+                        'default 3, and 0 for --bcrmsk)')
     p.add_argument('--maxfrac', type=float, default=None,
                    help='most of one slice that may be masked (default 0.5 for intf, '
                         '0.4 for thum, 1.0 = no limit for wl, where ZAP works per pixel)')
@@ -1377,42 +1683,47 @@ def parser_init():
 
 def main():
     args = parser_init().parse_args()
-    images = [(im, None) for im in args.images]
+    images = list(args.images)
     if args.json:
         images += frames_from_json(args.json, thum=args.thum, wl=args.wl,
-                                   allfiles=args.all, verbose=not args.quiet,
-                                   with_ref=True)
+                                   allfiles=args.all, verbose=not args.quiet)
     if not images:
         print('no frames given: pass file names or --json FILE')
         return
 
     if args.convert:
         # region file -> mask, no detection, nothing written over the .reg
-        for im, ref in images:
+        for im in images:
             if not os.path.exists(im):
                 print('skipping {}: not found'.format(im))
                 continue
             is_wl = args.wl or im.endswith('_wlimg.fits')
-            is_thum = (args.thum or ('thum' in os.path.basename(im))) and not is_wl
+            is_bcr = args.bcrmsk and not is_wl
+            is_thum = (args.thum or ('thum' in os.path.basename(im))) and not is_wl \
+                and not is_bcr
             regfn = args.regfrom
             if regfn is None and is_wl:
                 regfn = im.replace('_wlimg.fits', '.reg')
-            if regfn is None and ref is not None and ref != im:
-                # a group's region file is drawn on its first frame
-                regfn = (ref.replace('.fits', '.reg') if is_thum
-                         else ref.replace('_intf.fits', '.reg'))
+            if regfn is None and is_bcr:
+                regfn = im.replace('_intf.fits', '_bcrmsk.reg')
+            # thum and _intf fall through: convert_region derives the frame's
+            # own .reg name
             convert_region(im, regfn=regfn, edge_var=args.edge_var,
-                           kind='wl' if is_wl else 'thum' if is_thum else 'intf',
+                           kind='wl' if is_wl else 'bcrmsk' if is_bcr
+                                else 'thum' if is_thum else 'intf',
                            verbose=not args.quiet)
         return
 
-    for im, _ref in images:
+    for im in images:
         if not os.path.exists(im):
             print('skipping {}: not found'.format(im))
             continue
         is_wl = args.wl or im.endswith('_wlimg.fits')
-        is_thum = (args.thum or ('thum' in os.path.basename(im))) and not is_wl
+        is_bcr = args.bcrmsk and not is_wl
+        is_thum = (args.thum or ('thum' in os.path.basename(im))) and not is_wl \
+            and not is_bcr
         regfn = (im.replace('_wlimg.fits', '.reg') if is_wl else
+                 im.replace('_intf.fits', '_bcrmsk.reg') if is_bcr else
                  im.replace('.fits', '.reg') if is_thum else
                  im.replace('_intf.fits', '.reg'))
         if args.no_clobber and os.path.exists(regfn):
@@ -1424,13 +1735,13 @@ def main():
             automask_wl(im, edge_var=args.edge_var, min_usable=args.min_usable,
                         trim_nsig=args.trim_nsig,
                         nsig=4. if args.nsig is None else args.nsig,
-                        grow=1 if args.grow is None else args.grow,
+                        grow=2 if args.grow is None else args.grow,
                         minpix=args.minpix,
-                        grow_nsig=3. if args.grow_nsig is None else args.grow_nsig,
+                        grow_nsig=2. if args.grow_nsig is None else args.grow_nsig,
                         maxfrac=1.0 if args.maxfrac is None else args.maxfrac,
                         edge=0 if args.edge is None else args.edge,
                         max_radius=10. if args.max_radius is None else args.max_radius,
-                        shape='ellipse' if args.shape is None else args.shape,
+                        shape='polygon' if args.shape is None else args.shape,
                         write_mask=args.mask, plot=args.plot, verbose=not args.quiet)
         elif is_thum:
             automask_thum(im,
@@ -1443,16 +1754,37 @@ def main():
                           max_radius=6. if args.max_radius is None else args.max_radius,
                           shape='polygon' if args.shape is None else args.shape,
                           write_mask=args.mask, plot=args.plot, verbose=not args.quiet)
+        elif is_bcr:
+            if args.bcr_mode == 'strips':
+                sk = dict(bkg_window=args.bkg_window)
+                for k, v in [('nsig', args.nsig), ('grow_nsig', args.grow_nsig),
+                             ('grow', args.grow), ('maxfrac', args.maxfrac),
+                             ('ybin', args.ybin), ('wing_nsig', args.wing_nsig),
+                             ('seed_nsig', args.seed_nsig), ('bright_nsig', args.bright_nsig),
+                             ('bright_reach', args.bright_reach)]:
+                    if v is not None:
+                        sk[k] = v
+                automask_bcrmsk(im, mode='strips', edge_trim=args.edge_trim,
+                                plot=args.plot, verbose=not args.quiet, **sk)
+            else:
+                automask_bcrmsk(im, mode='spots', thresh=args.bcr_thresh,
+                                nsig=5. if args.nsig is None else args.nsig,
+                                zmed=args.bcr_zmed,
+                                grow=1 if args.grow is None else args.grow,
+                                minpix=args.minpix, edge_trim=args.edge_trim,
+                                plot=args.plot, verbose=not args.quiet)
         elif '_intf.fits' in im:
             automask_intf(im,
                           nsig=8. if args.nsig is None else args.nsig,
                           grow_nsig=3. if args.grow_nsig is None else args.grow_nsig,
-                          grow=1 if args.grow is None else args.grow,
+                          grow=3 if args.grow is None else args.grow,
                           edge_trim=args.edge_trim, adaptive=not args.rect,
-                          ybin=args.ybin, wing_nsig=args.wing_nsig,
-                          seed_nsig=args.seed_nsig, bright_nsig=args.bright_nsig,
-                          bright_reach=args.bright_reach,
-                          maxfrac=0.5 if args.maxfrac is None else args.maxfrac,
+                          ybin=200 if args.ybin is None else args.ybin,
+                          wing_nsig=3. if args.wing_nsig is None else args.wing_nsig,
+                          seed_nsig=5. if args.seed_nsig is None else args.seed_nsig,
+                          bright_nsig=20. if args.bright_nsig is None else args.bright_nsig,
+                          bright_reach=3 if args.bright_reach is None else args.bright_reach,
+                          maxfrac=1.0 if args.maxfrac is None else args.maxfrac,
                           bkg_window=args.bkg_window,
                           write_mask=args.mask, plot=args.plot, verbose=not args.quiet)
         else:

@@ -154,12 +154,17 @@ def kcwi_stack_readpar(parname='q0100-bx172.par'):
 
 
     # Alignment keywords
+    # one line per box: several align_box lines give several alignment boxes,
+    # which kcwi_align cross-correlates together (see _align_crls)
     q=np.where(np.array(keys)=="align_box")[0]
     if len(q) > 0:
-        q=q[0]
-        ele=lins[q].split()
-        tmp=np.array(ele[1:5]).astype(float)
-        par['align_box']=np.array([tmp[0],tmp[2],tmp[1],tmp[3]]).astype(int)
+        bxs=[]
+        for qq in q:
+            ele=lins[qq].split()
+            tmp=np.array(ele[1:5]).astype(float)
+            bxs.append([tmp[0],tmp[2],tmp[1],tmp[3]])
+        bxs=np.array(bxs).astype(int)
+        par['align_box']=bxs[0] if len(bxs)==1 else bxs
 
     q=np.where(np.array(keys)=="align_dimension")[0]
     if len(q) > 0:
@@ -962,8 +967,47 @@ def kcwi_resample_wave(hdu, newhdr, method='cubic',plot=False):
 
 
 
+def _crr_zsmooth(a, size, step=1):
+    """Running median along wavelength, evaluated every `step` channels.
+
+    Used for the per-spaxel scale between two cubes, which is smooth along
+    wavelength by construction, so there is no point evaluating it at every
+    channel: scipy's median_filter costs O(size) per output voxel and is ~80%
+    of the cosmic-ray rejection's run time on a long stack. Evaluating it on a
+    decimated grid and interpolating is about eight times faster and agrees to
+    ~1%, which then largely cancels in the ratio of two such medians.
+
+    Args:
+        a (ndarray): [nz, ny, nx].
+        size (int): width of the running median [channels].
+        step (int): evaluate every this many channels; 1 reproduces
+            ndimage.median_filter(a, (size, 1, 1), mode='nearest') exactly.
+
+    Returns:
+        ndarray: same shape as `a`.
+    """
+    nz = a.shape[0]
+    step = max(int(step), 1)
+    if step == 1 or nz < 2 * step:
+        return ndimage.median_filter(a, size=(int(size), 1, 1), mode='nearest')
+    h = int(size) // 2
+    zc = np.arange(0, nz, step)
+    if zc[-1] != nz - 1:
+        zc = np.append(zc, nz - 1)
+    sm = np.empty((len(zc),) + a.shape[1:], dtype=a.dtype)
+    for i, z in enumerate(zc):
+        sm[i] = np.median(a[max(z - h, 0):min(z + h + 1, nz)], axis=0)
+    w = np.interp(np.arange(nz), zc, np.arange(len(zc)))
+    lo = np.floor(w).astype(int)
+    hi = np.minimum(lo + 1, len(zc) - 1)
+    fr = (w - lo).reshape((-1,) + (1,) * (a.ndim - 1))
+    return sm[lo] * (1 - fr) + sm[hi] * fr
+
+
 def _crr_flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
-                       grow_xy=2, grow_z=2, grow_nsig=2., pad_xy=0, loo=None):
+                       grow_xy=2, grow_z=2, grow_nsig=2., pad_xy=0, loo=None,
+                       zratio=51, zstep=8, fsys=0.05, fgrad=0.5, grow_rel=0.25,
+                       smax=5.):
     """
     Flag positive outliers (cosmic rays) in each of N cubes on a common grid by
     comparing each cube with the other ones (used by kcwi_stack with crr_split).
@@ -985,9 +1029,55 @@ def _crr_flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=1
     once per cube; with fewer, the median of the others (leave-one-out) is used.
     `loo` overrides that choice.
 
+
+    Three guards keep a bright quasar from being clipped, where frame-to-frame
+    seeing and transparency differences are large in absolute terms:
+      - `zratio`: each cube is scaled to the comparison estimate per spaxel,
+        smoothly along wavelength, before the difference is taken;
+      - `fgrad`: a term proportional to the spatial gradient is added to the
+        noise, so that a sub-pixel registration error is not significant on
+        the steep flanks of a point source;
+      - `fsys`: a fractional term is added as well, but see below -- at the
+        default thresholds it never binds;
+      - `grow_rel`: the relative test is applied while growing too.
+    Set zratio=0, fsys=0, fgrad=0, grow_rel=0 for the previous behaviour.
+
     Args:
         I, V (ndarray [N, nz, ny, nx]): intensity and variance.
         good (bool ndarray [N, nz, ny, nx]): valid voxels.
+        zratio (int): channels over which the per-spaxel scale between a cube
+            and the comparison estimate is measured; 0 disables the matching.
+        zstep (int): channels between evaluations of that scale, which is
+            smooth along wavelength. 1 evaluates it everywhere and is the
+            slowest part of this function; 8 is ~8x faster, agrees to ~1% and
+            largely cancels in the ratio.
+        fsys (float): fractional systematic added in quadrature to the noise.
+            Inert at the default thresholds, and deliberately kept anyway.
+            Because L is the local MAXIMUM of |scale*est|, L >= |scale*est|
+            always, so the part of the absolute test this term controls,
+                D > nsig * fsys * |scale*est|,
+            is weaker than the relative test D > rel * L whenever
+                nsig * fsys <= rel,
+            which at the defaults is 5 * 0.05 = 0.25 against 0.5. Measured on
+            a synthetic bright quasar it exceeded the relative threshold in
+            0.000% of the bright voxels (median ratio 0.199, maximum 0.500,
+            the bound). The relative test is itself a fractional floor, ten
+            times stronger, so this one does nothing while rel is at 0.5.
+            It matters when you LOWER rel: rel = 0.5 means a cosmic ray on
+            the core of a quasar has to exceed half the quasar to be caught,
+            so if you want those you reduce rel, and fsys is then the only
+            brightness-aware guard left. Raising fsys above rel / nsig makes
+            it active; do not do that without re-checking that real cosmic
+            rays are still found.
+        fgrad (float): the same for the spatial gradient of the estimate,
+            which is what a sub-pixel registration error turns into: a frame
+            offset by d pixels differs by about d * |grad I|, so fgrad is that
+            offset in pixels. Unlike fsys this is not bounded by L -- on a
+            steep flank the per-pixel gradient is a large fraction of the peak
+            -- so it does bind, in about 28% of bright voxels, and removes
+            roughly a quarter of the remaining false positives.
+        grow_rel (float): relative threshold used while growing.
+        smax (float): the per-spaxel scale is clipped to [1/smax, smax].
 
     Returns:
         bool ndarray [N, nz, ny, nx]: outlier flags.
@@ -1002,6 +1092,7 @@ def _crr_flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=1
     s_z[:, 1, 1] = True
     if loo is None:
         loo = (N < 5)
+    Esm_all = None
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         if not loo:
@@ -1010,9 +1101,6 @@ def _crr_flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=1
             est_all = np.nanmedian(Ig, axis=0)
             var_all = (np.where(n_all >= 3, np.pi / 2., 1.) *
                        np.nanmean(Vg, axis=0) / np.maximum(n_all, 1))
-            L_all = ndimage.maximum_filter(np.nan_to_num(np.abs(est_all)),
-                                           size=(int(zwindow), int(window), int(window)),
-                                           mode='nearest')
         for k in range(N):
             if not loo:
                 est, var_est, n_oth = est_all, var_all, n_all - good[k]
@@ -1026,18 +1114,64 @@ def _crr_flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=1
                     corr = np.where(n_oth >= 3, np.pi / 2., 1.)
                     var_est = corr * np.nanmean(Vg[oth], axis=0) / np.maximum(n_oth, 1)
             testable = good[k] & (n_oth > 0) & np.isfinite(est) & np.isfinite(var_est)
-            sig = np.sqrt(np.where(testable, V[k] + var_est, np.inf))
-            D = np.where(testable, I[k] - est, 0.)
+            e0 = np.nan_to_num(est)
+            # Scale match before differencing. Seeing and transparency make one
+            # frame a smoothly wavelength-dependent multiple of the others at
+            # every spaxel, and high-passing that DIFFERENCE turns every narrow
+            # spectral feature into a positive spike: where an absorption line
+            # cuts the flux, the deficit of a fainter frame shrinks, and the
+            # running median leaves a cosmic-ray-shaped residual. Dividing the
+            # mismatch out first removes it at the source. The scale is the
+            # ratio of the two cubes smoothed over zratio channels (and 3x3
+            # spatially, so the faint halo is matched too), which cosmic rays,
+            # being a few channels wide, cannot move.
+            if zratio and zratio > 1:
+                nsm = int(zratio) * 9
+                Ism = ndimage.uniform_filter(
+                    _crr_zsmooth(np.nan_to_num(Ig[k]), zratio, zstep),
+                    size=(1, 3, 3), mode='nearest')
+                if loo:
+                    Esm = ndimage.uniform_filter(
+                        _crr_zsmooth(e0, zratio, zstep), size=(1, 3, 3), mode='nearest')
+                else:
+                    # est is the same cube for every k, so smooth it once
+                    if Esm_all is None:
+                        Esm_all = ndimage.uniform_filter(
+                            _crr_zsmooth(e0, zratio, zstep), size=(1, 3, 3), mode='nearest')
+                    Esm = Esm_all
+                ok_s = Esm > 3. * np.sqrt(np.nan_to_num(var_est) / nsm)
+                scale = np.where(ok_s & (Esm != 0), Ism / np.where(Esm == 0, 1., Esm), 1.)
+                scale = np.clip(np.nan_to_num(scale, nan=1.), 1. / smax, smax)
+            else:
+                scale = np.ones_like(e0)
+            se = scale * e0
+            D = np.where(testable, I[k] - se, 0.)
             if zmed and zmed > 1:
                 D = D - ndimage.median_filter(D, size=(int(zmed), 1, 1), mode='nearest')
-            if loo:
-                L = ndimage.maximum_filter(np.nan_to_num(np.abs(est)),
-                                           size=(int(zwindow), int(window), int(window)), mode='nearest')
-            else:
-                L = L_all
+            # Noise budget. The photon term alone scales as sqrt(I), so on a
+            # bright quasar any residual percent-level mismatch is formally
+            # significant; fgrad and fsys add the systematic floor the
+            # frame-to-frame scatter actually has. fgrad is the one that does
+            # the work -- fsys is dominated by the relative test below unless
+            # nsig * fsys > rel, see the docstring.
+            var = V[k] + scale ** 2 * np.nan_to_num(var_est)
+            if fsys:
+                var = var + (fsys * np.abs(se)) ** 2
+            if fgrad:
+                var = var + (fgrad * np.maximum(np.abs(np.gradient(se, axis=1)),
+                                                np.abs(np.gradient(se, axis=2)))) ** 2
+            sig = np.sqrt(np.where(testable, var, np.inf))
+            L = ndimage.maximum_filter(np.abs(se),
+                                       size=(int(zwindow), int(window), int(window)),
+                                       mode='nearest')
             f = testable & (D > nsig * sig) & (D > rel * L)
             if f.any():
                 cand = testable & (D > grow_nsig * sig)
+                if grow_rel:
+                    # the relative test has to hold while growing as well, or a
+                    # cosmic ray beside a bright source grows into it, where a
+                    # 2-sigma condition is met by the mismatch alone
+                    cand &= (D > grow_rel * L)
                 for _ in range(int(grow_z)):
                     new = ndimage.binary_dilation(f, structure=s_z) & cand & ~f
                     if not new.any():
@@ -1054,7 +1188,7 @@ def _crr_flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=1
     return flags
 
 
-def _crr_frame_reject(sub, subv, ok, flag_g, est, vest, frame_nsig=3.):
+def _crr_frame_reject(sub, subv, ok, flag_g, est, vest, frame_nsig=3., fsys=0.05):
     """
     Decide which frame(s) of a group cause the outliers flagged in that group
     (used when crr_split groups several frames together, e.g. split-half).
@@ -1083,7 +1217,10 @@ def _crr_frame_reject(sub, subv, ok, flag_g, est, vest, frame_nsig=3.):
     m = sub.shape[0]
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
-        z = np.where(ok, (sub - est) / np.sqrt(subv + vest), -np.inf)
+        # the same fractional floor as in _crr_flag_outliers: without it the
+        # frame with the best seeing is the one rejected at a bright source
+        vsys = (fsys * np.abs(np.nan_to_num(est))) ** 2 if fsys else 0.
+        z = np.where(ok, (sub - est) / np.sqrt(subv + vest + vsys), -np.inf)
         subg = np.where(ok, sub, np.nan)
         subvg = np.where(ok, subv, np.nan)
         for j in range(m):
@@ -1095,7 +1232,8 @@ def _crr_frame_reject(sub, subv, ok, flag_g, est, vest, frame_nsig=3.):
             med = np.nanmedian(subg[oth], axis=0)
             corr = np.where(n_o >= 3, np.pi / 2., 1.)
             vmed = corr * np.nanmean(subvg[oth], axis=0) / np.maximum(n_o, 1)
-            z2 = (sub[j] - med) / np.sqrt(subv[j] + vmed)
+            vsys2 = (fsys * np.abs(np.nan_to_num(med))) ** 2 if fsys else 0.
+            z2 = (sub[j] - med) / np.sqrt(subv[j] + vmed + vsys2)
             loo = (n_o == 0) | (np.nan_to_num(z2, nan=-np.inf) > frame_nsig)
             rej[j] = base & ok[j] & (z[j] > frame_nsig) & loo
         # fallback: nothing passed, so reject the most deviant valid frame
@@ -1107,15 +1245,172 @@ def _crr_frame_reject(sub, subv, ok, flag_g, est, vest, frame_nsig=3.):
     return rej
 
 
+
+def _crr_mask_fn(cubefn, crr_mask_dir='', kind='crmsk'):
+    """Where the per-frame CR mask (or pre-mask) for one input cube lives.
+
+    <dir>/<frame base>.crmsk.fits, with <dir> defaulting to the directory the
+    input cube sits in.
+    """
+    base = os.path.basename(cubefn)
+    for suf in ('_icubes.fits', '_icubed.fits', '_icube.fits', '.fits'):
+        if base.endswith(suf):
+            base = base[:-len(suf)]
+            break
+    d = crr_mask_dir if crr_mask_dir else os.path.dirname(cubefn)
+    if d and not path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    return os.path.join(d, base + '.' + kind + '.fits')
+
+
+# What moves a FRAME relative to the grid. These are the trap: kcwi_stack
+# applies the shift list, the pre-shift and the astrometry correction to each
+# frame's own CRPIX/CRVAL and never touches hdr0, so the grid signature is
+# identical whether or not the data underneath it moved. A mask reused across
+# a change of shift list would land on the wrong voxels and say nothing.
+_CRR_PLACE_KEYS = ('CRMXSH', 'CRMYSH', 'CRMPRA', 'CRMPDEC', 'CRMASRA', 'CRMASDE')
+
+_CRR_GRID_KEYS = (('CRMNX', None), ('CRMNY', None), ('CRMNZ', None),
+                  ('CRMCRV1', 'CRVAL1'), ('CRMCRV2', 'CRVAL2'), ('CRMCRV3', 'CRVAL3'),
+                  ('CRMCRP1', 'CRPIX1'), ('CRMCRP2', 'CRPIX2'), ('CRMCRP3', 'CRPIX3'),
+                  ('CRMCD11', 'CD1_1'), ('CRMCD12', 'CD1_2'),
+                  ('CRMCD21', 'CD2_1'), ('CRMCD22', 'CD2_2'), ('CRMCD33', 'CD3_3'))
+
+
+def _crr_grid(hdr0, dimension):
+    """The stacked grid a CR mask is tied to, key by key.
+
+    A CR mask is a set of voxels on the COMMON grid, so it only means anything
+    on the grid it was made on: change the pixel scale, the dimensions, the
+    orientation or the wavelength sampling and voxel (i,j,k) no longer refers
+    to the same piece of sky.
+
+    Worth knowing when you plan to reuse a mask: kcwi_stack does NOT build the
+    grid from the union of the frames, it takes the tangent point from the
+    FIRST frame in the list and the rest from the .par. So a stack of a subset
+    lands on the same grid as the full stack only if the first frame and the
+    .par are the same. Pin the grid explicitly -- stack_ad in the .par, plus
+    wave_ref / nwave / dwave -- and it stops depending on the frame list at
+    all, which is what makes 'detect on all frames, combine a subset' work.
+    """
+    g = {}
+    for kw, src in _CRR_GRID_KEYS:
+        if src is None:
+            g[kw] = {'CRMNX': int(dimension[0]), 'CRMNY': int(dimension[1]),
+                     'CRMNZ': int(hdr0['NAXIS3'])}[kw]
+        else:
+            g[kw] = round(float(hdr0[src]), 10) if src in hdr0 else None
+    return g
+
+
+def _crr_grid_id(hdr0, dimension):
+    """One hash over _crr_grid, written into the mask and checked on reuse."""
+    import hashlib
+    g = _crr_grid(hdr0, dimension)
+    return hashlib.md5(repr([g[k] for k, _ in _CRR_GRID_KEYS]).encode()).hexdigest()[:16]
+
+
+def _crr_read_mask(fnmask, gridid, shape, grid=None, place=None):
+    """Load a per-frame mask, refusing it if it was not made on this grid.
+
+    Returns (mask, '') or (None, reason). When the grid differs the reason
+    names the keys that moved, because 'different grid' on its own leaves you
+    guessing which knob to pin.
+    """
+    if not path.isfile(fnmask):
+        return None, 'no file'
+    try:
+        hdul = fits.open(fnmask)
+        hdu = next((h for h in hdul if h.data is not None), hdul[0])
+        got = hdu.header.get('CRGRIDID', '')
+        if got != gridid:
+            diff = []
+            if grid is not None:
+                for kw, _ in _CRR_GRID_KEYS:
+                    was, now = hdu.header.get(kw, None), grid[kw]
+                    if was is None or now is None:
+                        continue
+                    if abs(float(was) - float(now)) > 1e-9:
+                        diff.append('{} {:g}->{:g}'.format(kw, float(was), float(now)))
+            return None, ('different output grid' +
+                          (' [' + ', '.join(diff) + ']' if diff else
+                           ' ({} != {})'.format(got, gridid)))
+        if tuple(hdu.data.shape) != tuple(shape):
+            return None, 'shape {} != {}'.format(tuple(hdu.data.shape), tuple(shape))
+        if place is not None:
+            moved = []
+            for kw in _CRR_PLACE_KEYS:
+                was, now = hdu.header.get(kw, None), place.get(kw, None)
+                if was is None or now is None:
+                    continue
+                if abs(float(was) - float(now)) > 1e-6:
+                    moved.append('{} {:g}->{:g}'.format(kw, float(was), float(now)))
+            if moved:
+                return None, 'the frame moved on the grid [' + ', '.join(moved) + ']'
+            src = hdu.header.get('CRMSRC', None)
+            if src is not None and place.get('CRMSRC') and src != place['CRMSRC']:
+                return None, 'belongs to {}, not {}'.format(src, place['CRMSRC'])
+        return hdu.data.astype(bool), ''
+    except Exception as e:
+        return None, 'unreadable ({})'.format(e)
+
+
+def _crr_write_mask(fnmask, rej, gridid, dimension, hdr0, frames, params, place=None):
+    """Write one frame's CR mask, with everything needed to validate reuse.
+
+    Tile-compressed: the mask is one byte per voxel and almost entirely zero,
+    so a 100x120x2596 grid is 31 MB raw and 0.05 MB here. Over a 34-frame
+    stack that is the difference between ~1 GB of masks and ~2 MB.
+    astropy reads it back like any other image.
+    """
+    data = rej.astype(np.uint8)
+    # Tile along wavelength in slabs. The astropy default is one tile per ROW,
+    # which for a 100-pixel row is almost all per-tile overhead: the same mask
+    # is 10 MB that way and 0.05 MB in slabs of 64 channels. The keyword is
+    # tile_shape on astropy >= 5.3 and tile_size (reversed axes) before that,
+    # and an uncompressed image is still a correct mask if neither works.
+    tile = (min(64, data.shape[0]), data.shape[1], data.shape[2])
+    try:
+        hdu = fits.CompImageHDU(data, compression_type='GZIP_1', tile_shape=tile)
+    except TypeError:
+        try:
+            hdu = fits.CompImageHDU(data, compression_type='GZIP_1',
+                                    tile_size=tuple(reversed(tile)))
+        except Exception:
+            hdu = fits.CompImageHDU(data, compression_type='GZIP_1')
+    h = hdu.header
+    h['CRGRIDID'] = (gridid, 'grid signature; valid only on this grid')
+    for kw, val in _crr_grid(hdr0, dimension).items():
+        if val is not None:
+            h[kw] = val
+    for kw, val in (place or {}).items():
+        h[kw] = val
+    h['CRMNREJ'] = (int(rej.sum()), 'voxels rejected in this frame')
+    h['CRMNFRM'] = (len(frames), 'frames compared to make this mask')
+    for j, f in enumerate(frames[:99]):
+        h['CRMFR%02d' % j] = os.path.basename(f)[:60]
+    for k, v in params.items():
+        h[k] = v
+    h['COMMENT'] = 'Per-frame CR mask from kcwi_stack(crr_split=True).'
+    h['COMMENT'] = '1 = voxel rejected in this frame.'
+    h['COMMENT'] = 'Reuse with crr_reuse_mask=True on the same grid.'
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(fnmask, overwrite=True)
+
+
 def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscale_y=0.,
                dimension=[0,0],orientation=-1000.,cubed=False,drizzle=0,weights=[],
                wave_ref=[0, 0], dwave=0, nwave=0, wave_interp_method='cubic',
                overwrite=False,keep_trim=False,keep_mont=False,method='drizzle',use_astrom=False,
                use_regmask=True, low_mem=False, montagepy=flag_montagepy, crr=False, crr_save_files=False,
                crrthresh=100, medcube=False, nsigma_clip=10, npix_trim = 3,
-               crr_split=False, crr_split_mode='frame', crr_nsig=5., crr_rel=0.5,
+               crr_split=False, crr_split_mode='auto', crr_nsig=5., crr_rel=0.5,
                crr_window=5, crr_zwindow=3, crr_zmed=15, crr_grow_xy=2, crr_grow_z=2,
-               crr_grow_nsig=2., crr_pad_xy=0, crr_frame_nsig=3., crr_zblock=100):
+               crr_grow_nsig=2., crr_pad_xy=0, crr_frame_nsig=3., crr_zblock=None,
+               crr_maxmem=2.0,
+               crr_zratio=51, crr_zstep=8, crr_fsys=0.05, crr_fgrad=0.5,
+               crr_grow_rel=0.1, crr_pergroup=7,
+               crr_mask_dir='', crr_save_mask=False, crr_reuse_mask=False,
+               crr_premask=False):
     """
     Stacking the individual data cubes.
 
@@ -1156,6 +1451,7 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             small slicer.
         montagepy (bool): use MontagePy for drizzling? Otherwise, use the command
             line Montage installation. Both require proper installation.
+        #------------------------- Legacy CRR parameters (deprecated) -------------------------
         crr (bool): perform final CRR when stacking based on flux outliers?
         crr_save_files (bool): save trimmed cubes with CRs masked?
         crrthresh (float): Default value = 100. Sets the threshold level above
@@ -1165,6 +1461,7 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             remove residual cosmic rays. Default=1.5.
         npix_trim (int): number of pixels to trim from the edges of a cube. Default = 3.
             May want npix_trim = 1 for Large slicer.
+        #-------------------------- THE ACTUAL CRR PARAMETERS --------------------------
         crr_split (bool): cosmic-ray rejection after the frames have been shifted
             and projected onto the common grid. Each frame (or each group of
             frames, see crr_split_mode) is compared with the median of the
@@ -1174,7 +1471,16 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             level (crr_rel); see _crr_flag_outliers. Only positive outliers are
             rejected. The flagged voxels are masked in that frame alone before
             the final stack. Can be combined with crr (which runs first).
-        crr_split_mode (str or array): how the frames are compared.
+        crr_split_mode (str, int or array): how the frames are compared.
+            An integer N splits the frames into N groups of consecutive frames
+            (34 into 5 gives 7,7,7,7,6); 'auto' picks N so that each group
+            holds about crr_pergroup frames. The run time is linear in the
+            number of groups, so 'frame' on a 34-frame stack costs about seven
+            times what five groups do; the frame responsible for each flagged
+            voxel is still identified individually inside its group by
+            _crr_frame_reject, so grouping costs accuracy only where two
+            cosmic rays from different frames of the same group land on the
+            same voxel.
             'frame' (default): every frame is compared with the median of all
                 the other frames. The most sensitive option; needs >= 3 frames
                 to be robust (>= 4-5 is comfortable).
@@ -1199,11 +1505,79 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
         crr_grow_z (int): maximum spectral growth (pixels), same rule.
         crr_grow_nsig (float): threshold for growing.
         crr_pad_xy (int): unconditional spatial margin (pixels). 0 = off.
+        crr_mask_dir (str): directory holding the per-frame CR masks written by
+            crr_save_mask and read back by crr_reuse_mask / crr_premask. The
+            default ('') puts them next to the input cubes. A mask is named
+            <frame base>.crmsk.fits and a pre-mask <frame base>.premsk.fits.
+        crr_save_mask (bool): write each frame's rejected voxels to its own
+            file after the comparison. The mask records the signature of the
+            grid it was made on and the frames that took part, so a later run
+            can tell whether it still applies.
+        crr_reuse_mask (bool): load the saved masks instead of comparing the
+            frames again. This is all-or-nothing on purpose: if any frame has
+            no valid mask the comparison is redone for every frame, because
+            the rejection in one frame depends on which other frames it was
+            compared with, so a stack with a different frame list deserves
+            fresh statistics rather than a silent mixture.
+
+            Its real use is deliberately decoupling the frames you detect
+            cosmic rays with from the frames you combine. Run once over every
+            frame of a field with crr_save_mask=True, then stack whatever
+            subset you want with crr_reuse_mask=True: the subset inherits the
+            rejection quality of the full set. On a field where saturation or
+            bad seeing leaves only two or three usable frames, that is the
+            difference between a median of two -- which cannot tell which of
+            the two is the outlier -- and a median of everything you took.
+        crr_premask (bool): before the statistics, read <base>.premsk.fits for
+            each frame and treat those voxels as bad. They are left out of the
+            median, so a known-bad value cannot drag the estimate and make the
+            good frames look like outliers, and they are also rejected in the
+            stack. This is where a saturation mask belongs: a clipped QSO core
+            sits BELOW the true flux, so leaving it in the comparison biases
+            the median down exactly where the source is brightest. Pre-masks
+            are applied fresh on every run and are never folded into the saved
+            .crmsk.fits, so editing one takes effect without re-running the
+            comparison.
+        crr_pergroup (int): target frames per group for crr_split_mode='auto'.
+        crr_zstep (int): channels between evaluations of the per-spaxel scale,
+            which is smooth along wavelength; 1 evaluates it at every channel
+            (slow). 8 is about eight times faster and agrees to ~1%, which
+            then largely cancels in the ratio.
+        crr_zratio (int): channels over which each frame is scaled to the
+            comparison estimate per spaxel before differencing, so that
+            seeing and transparency differences do not leave cosmic-ray-shaped
+            residuals at the narrow features of a bright source. 0 = off.
+        crr_fsys (float): fractional frame-to-frame systematic added to the
+            noise. It has no effect while crr_nsig * crr_fsys <= crr_rel
+            (at the defaults, 0.25 against 0.5), because the relative test is
+            already a stronger fractional floor -- it is here for when you
+            lower crr_rel to catch cosmic rays on a bright source. See
+            _crr_flag_outliers.
+        crr_fgrad (float): the same for the spatial gradient, i.e. the error a
+            sub-pixel registration offset produces; this one does bind.
+        crr_grow_rel (float): relative threshold while growing, so a cosmic ray
+            beside a bright source cannot grow into it.
         crr_frame_nsig (float): threshold for picking the responsible frame(s)
             at a flagged voxel. Only used when a group holds several frames.
-        crr_zblock (int): number of wavelength slices processed at a time when
-            flagging. Memory scales as n_frames * crr_zblock * nx * ny; lower it
-            for many frames or a large field.
+        crr_zblock (int): number of wavelength channels processed at a time
+            when flagging, or None (the default) to size it automatically from
+            crr_maxmem. Each block also reads `pad` channels on either side so
+            the wavelength filters see a full window, and pad is now
+            max(crr_zwindow, crr_zmed, crr_zratio)//2 + crr_grow_z + 1, i.e. 28
+            with the defaults. A small block therefore spends most of its time
+            on overlap: at 100 channels, 56% of the work is redundant, at 300
+            it is 19%. Memory scales as
+                (n_frames * 13 + n_groups * 9) * nx * ny * (crr_zblock + 2*pad)
+            bytes, on top of a fixed n_frames * nz * nx * ny bits for the
+            rejection cube itself.
+        crr_maxmem (float): target working set per block [GB] when crr_zblock
+            is None. Raising it makes the blocks bigger, which is strictly
+            better for accuracy -- a single block over the whole cube is the
+            exact answer and every extra boundary is a place where the
+            wavelength filters see a window assembled from a margin rather
+            than real data. The only costs of a big block are memory and a
+            coarser progress bar. The chosen value, the number of blocks, the
+            extra work from the margins and the peak memory are printed.
 
     Returns:
         None
@@ -1641,7 +2015,7 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
                 if not kcwi_check_samewave(hdu_i.header, hdr0):
                     print('  Different wavelength grid: interpolating...')
 
-                    hdu_i = kcwi_resample_wave(hdu_i, hdr0, method=wave_interp_method,plot=True)
+                    hdu_i = kcwi_resample_wave(hdu_i, hdr0, method=wave_interp_method,plot=False)
                     hdu_v = kcwi_resample_wave(hdu_v, hdr0, method=wave_interp_method)
                     hdu_m = kcwi_resample_wave(hdu_m, hdr0, method='mask')
                     hdu_e = kcwi_resample_wave(hdu_e, hdr0, method='linear')
@@ -1756,7 +2130,7 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             #print(newcubem.shape)
             #print(newcubee.shape)
 
-    # CR Final Rejection, if needed
+    # Legacy CR Rejection, if needed
     if crr:
         crrfn=trimfn[i].replace('.trim.fits','.crr.fits')
         crrvfn=trimvfn[i].replace('.trim.fits','.crr.fits')
@@ -1797,8 +2171,22 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
                 crr_groups = (np.arange(nfn) >= nfn // 2).astype(int)
             elif crr_split_mode == 'alternate':
                 crr_groups = (np.arange(nfn) % 2).astype(int)
+            elif crr_split_mode == 'auto':
+                # keep the run time sane on a long stack: the cost is linear in
+                # the number of groups, so aim at crr_pergroup frames each
+                ng = max(2, min(nfn, int(round(nfn / float(crr_pergroup)))))
+                crr_groups = (np.arange(nfn) * ng) // nfn
             else:
-                raise ValueError("crr_split_mode must be 'frame', 'half', 'alternate', or an array")
+                raise ValueError("crr_split_mode must be 'frame', 'half', 'alternate', "
+                                 "'auto', an integer number of groups, or an array")
+        elif np.isscalar(crr_split_mode):
+            # an integer: that many groups of consecutive frames, as equal as
+            # they divide. 34 frames into 5 gives 7,7,7,7,6.
+            ng = int(crr_split_mode)
+            if ng < 2 or ng > nfn:
+                raise ValueError('crr_split_mode as a number of groups must be '
+                                 'between 2 and the number of frames ({})'.format(nfn))
+            crr_groups = (np.arange(nfn) * ng) // nfn
         else:
             crr_groups = np.asarray(crr_split_mode).astype(int)
             if len(crr_groups) != nfn:
@@ -1818,9 +2206,114 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
         ny3 = dimension[1]
         nx3 = dimension[0]
         crr_rej = np.zeros((nfn, nz3, ny3, nx3), dtype=bool)
-        pad = max(int(crr_zwindow), int(crr_zmed)) // 2 + int(crr_grow_z) + 1
+
+        # ---- per-frame masks: pre-masks in, CR masks out -----------------
+        crr_gridid = _crr_grid_id(hdr0, dimension)
+        crr_gridkeys = _crr_grid(hdr0, dimension)
+        crr_shape = (nz3, ny3, nx3)
+
+        def _crr_place(i):
+            """Everything that moves frame i relative to the common grid."""
+            pr = pd = 0.
+            if preshiftfn != '':
+                ix = np.where(np.array(prefn) == os.path.basename(fn[i]))[0]
+                if len(ix):
+                    pr, pd = float(prera[ix[0]]), float(predec[ix[0]])
+            return {'CRMXSH': float(xshift[i]), 'CRMYSH': float(yshift[i]),
+                    'CRMPRA': pr, 'CRMPDEC': pd,
+                    'CRMASRA': float(astrom_rashift),
+                    'CRMASDE': float(astrom_decshift),
+                    'CRMSRC': os.path.basename(fn[i])[:60]}
+        crr_mskfn = [_crr_mask_fn(f, crr_mask_dir, 'crmsk') for f in fn]
+
+        crr_pre = None
+        if crr_premask:
+            crr_pre = np.zeros((nfn, nz3, ny3, nx3), dtype=bool)
+            npre = 0
+            for i in range(nfn):
+                m, why = _crr_read_mask(_crr_mask_fn(fn[i], crr_mask_dir, 'premsk'),
+                                        crr_gridid, crr_shape, crr_gridkeys, _crr_place(i))
+                if m is not None:
+                    crr_pre[i] = m
+                    npre += 1
+                elif why != 'no file':
+                    print('  [WARNING] pre-mask for {} ignored: {}'.format(
+                        os.path.basename(fn[i]), why))
+            if npre:
+                print('  pre-masks: {}/{} frames, {} voxels excluded from the '
+                      'statistics and from the stack'.format(npre, nfn, int(crr_pre.sum())))
+            else:
+                print('  crr_premask is set but no usable .premsk.fits was found.')
+                crr_pre = None
+
+        crr_reused = False
+        if crr_reuse_mask:
+            loaded, why_not = [], []
+            for i in range(nfn):
+                m, why = _crr_read_mask(crr_mskfn[i], crr_gridid, crr_shape,
+                                        crr_gridkeys, _crr_place(i))
+                loaded.append(m)
+                if m is None:
+                    why_not.append('{}: {}'.format(os.path.basename(fn[i]), why))
+            if not why_not:
+                for i in range(nfn):
+                    crr_rej[i] = loaded[i]
+                crr_reused = True
+                # the mask is tile-compressed, so its keywords live in ext 1
+                try:
+                    nmade = fits.getheader(crr_mskfn[0], 1).get('CRMNFRM', nfn)
+                except Exception:
+                    nmade = fits.getheader(crr_mskfn[0]).get('CRMNFRM', nfn)
+                print('  reusing saved CR masks for all {} frames (made by comparing {} '
+                      'frames); skipping the comparison'.format(nfn, nmade))
+            else:
+                print('  cannot reuse the saved CR masks, recomputing for every frame:')
+                for w in why_not[:10]:
+                    print('    ' + w)
+                if len(why_not) > 10:
+                    print('    ... and {} more'.format(len(why_not) - 10))
+                if any('the frame moved on the grid' in w for w in why_not):
+                    print('    [hint] the shift list, the pre-shift and use_astrom move '
+                          'each frame on the grid without changing the grid itself, so a '
+                          'mask made before they changed points at the wrong voxels. '
+                          'Use the same .shift.list for both runs.')
+                if any('different output grid' in w for w in why_not):
+                    print('    [hint] the grid follows the FIRST frame in the list plus '
+                          'the .par. Pin stack_ad in the .par and pass wave_ref / nwave / '
+                          'dwave to make it independent of which frames you stack.')
+
+        # Margin for the widest filter applied along wavelength, which is the
+        # zratio scale window (51 channels), not just zmed. The effect is
+        # small -- the truncation at a block edge biases the numerator and the
+        # denominator of the scale the same way and largely cancels, and a
+        # test with marginal cosmic rays piled on a block boundary moved 1
+        # flag in 70 between pad 10 and pad 28, none in realistic cases -- but
+        # with the block sized by crr_maxmem the margin is cheap and the
+        # blocked result then matches the unblocked one exactly.
+        pad = max(int(crr_zwindow), int(crr_zmed), int(crr_zratio)) // 2 \
+            + int(crr_grow_z) + 1
+        per_chan = (ny3 * nx3) * (nfn * 13 + crr_ngroup * 9)
+        if crr_zblock is None:
+            # the largest block that keeps the working set under crr_maxmem,
+            # then evened out: ceil(nz/blk) blocks of ceil(nz/nblocks) channels
+            # each. Taking blk straight from the memory budget leaves a long
+            # first block and a short last one, which costs the same total
+            # work but sets the peak memory by the long one -- 2596 channels
+            # at blk=2216 is 2244 + 408, where two blocks of 1298 do the same
+            # work with 59% of the peak.
+            blk = int(crr_maxmem * 1e9 / max(per_chan, 1)) - 2 * pad
+            blk = int(min(max(blk, 4 * pad), nz3))
+            nblk = int(np.ceil(nz3 / float(blk)))
+            crr_zblock = int(np.ceil(nz3 / float(nblk)))
+        edges = list(range(0, nz3, crr_zblock))
+        nproc = sum(min(z + crr_zblock + pad, nz3) - max(z - pad, 0) for z in edges)
+        if not crr_reused:
+            print('  crr_zblock = {} ({} block(s), {:.1f}% extra work from the {}-channel '
+              'margins, {:.1f} GB peak)'.format(
+                  crr_zblock, len(edges), 100. * (nproc / float(nz3) - 1.), pad,
+                  per_chan * min(crr_zblock + 2 * pad, nz3) / 1e9))
         n_test = 0
-        for z0 in tqdm(range(0, nz3, crr_zblock)):
+        for z0 in (tqdm(range(0, nz3, crr_zblock)) if not crr_reused else []):
             z1 = min(z0 + crr_zblock, nz3)
             p0, p1 = max(z0 - pad, 0), min(z1 + pad, nz3)
             nzb = p1 - p0
@@ -1830,7 +2323,7 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             f_ok = np.zeros(f_i.shape, dtype=bool)
             for i in range(nfn):
                 if low_mem == False:
-                    c_i, c_v = data0[i, p0:p1], vdata0[i, p0:p1]
+                    c_i, c_v = data0[i, p0:p1], vdata0[i, p0:p1] #reading the montage drizzled cubes already in memory
                     c_m, c_e = mdata0[i, p0:p1], edata0[i, p0:p1]
                 else:
                     c_i = np.nan_to_num(fits.open(montfns[i], memmap=True)[0].data[p0:p1])
@@ -1839,6 +2332,8 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
                     c_m[~np.isfinite(c_m)] = 128
                     c_e = np.nan_to_num(fits.open(montefns[i], memmap=True)[0].data[p0:p1])
                 ok = (c_m == 0) & np.isfinite(c_i) & np.isfinite(c_v) & (c_v != 0) & (c_e > 0)
+                if crr_pre is not None:
+                    ok &= ~crr_pre[i, p0:p1]
                 f_i[i], f_v[i], f_ok[i] = c_i, c_v, ok
                 if medcube:
                     f_w[i] = ok
@@ -1851,7 +2346,7 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             if crr_ngroup == nfn:
                 g_i, g_v, g_good = f_i, f_v, f_ok
             else:
-                g_i = np.zeros((crr_ngroup, nzb, ny3, nx3))
+                g_i = np.zeros((crr_ngroup, nzb, ny3, nx3), dtype=np.float32)
                 g_v = np.zeros_like(g_i)
                 g_good = np.zeros(g_i.shape, dtype=bool)
                 for g in range(crr_ngroup):
@@ -1866,7 +2361,10 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
             flags = _crr_flag_outliers(g_i, g_v, g_good, nsig=crr_nsig, rel=crr_rel,
                                        window=crr_window, zwindow=crr_zwindow, zmed=crr_zmed,
                                        grow_xy=crr_grow_xy, grow_z=crr_grow_z,
-                                       grow_nsig=crr_grow_nsig, pad_xy=crr_pad_xy)
+                                       grow_nsig=crr_grow_nsig, pad_xy=crr_pad_xy,
+                                       zratio=crr_zratio, zstep=crr_zstep,
+                                       fsys=crr_fsys, fgrad=crr_fgrad,
+                                       grow_rel=crr_grow_rel)
             c = slice(z0 - p0, z0 - p0 + (z1 - z0))
             n_test += int((g_good.sum(axis=0) > 1)[c].sum())
             for g in range(crr_ngroup):
@@ -1889,13 +2387,39 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
                                 np.nanmean(np.where(g_good[oth], g_v[oth], np.nan), axis=0) /
                                 np.maximum(n_o, 1))
                 rej = _crr_frame_reject(f_i[mem], f_v[mem], f_ok[mem], flags[g], est, vest,
-                                        frame_nsig=crr_frame_nsig)
+                                        frame_nsig=crr_frame_nsig, fsys=crr_fsys)
                 for jj, fr in enumerate(mem):
                     crr_rej[fr, z0:z1] = rej[jj][c]
             del f_i, f_v, f_w, f_ok, g_i, g_v, g_good, flags
 
+        # Save the cosmic-ray flags BEFORE folding in the pre-mask: the
+        # pre-mask is the user's own input, is re-read on every run and may be
+        # edited between runs, so baking it into the saved .crmsk.fits would
+        # make a stale copy of it impossible to get rid of.
+        if crr_save_mask and not crr_reused:
+            par = dict(CRMNSIG=(float(crr_nsig), 'crr_nsig'),
+                       CRMREL=(float(crr_rel), 'crr_rel'),
+                       CRMZRAT=(int(crr_zratio), 'crr_zratio'),
+                       CRMFSYS=(float(crr_fsys), 'crr_fsys'),
+                       CRMFGRAD=(float(crr_fgrad), 'crr_fgrad'),
+                       CRMGREL=(float(crr_grow_rel), 'crr_grow_rel'),
+                       CRMNGRP=(int(crr_ngroup), 'number of comparison groups'),
+                       CRMPRE=(bool(crr_pre is not None), 'a pre-mask was applied'))
+            for i in range(nfn):
+                _crr_write_mask(crr_mskfn[i], crr_rej[i], crr_gridid, dimension,
+                                hdr0, list(fn), par, _crr_place(i))
+            print('  CR masks written to {}'.format(
+                os.path.dirname(crr_mskfn[0]) or '.'))
+
+        if crr_pre is not None:
+            crr_rej |= crr_pre
+
         crr_nrej_frame = crr_rej.reshape(nfn, -1).sum(axis=1).astype(np.int64)
         for i in range(nfn):
+            if crr_reused:
+                print('  {}: {} voxels masked (reused)'.format(
+                    os.path.basename(fn[i]), crr_nrej_frame[i]))
+                continue
             frac = crr_nrej_frame[i] / max(n_test, 1)
             print('  {}: {} voxels rejected ({:.3g}% of testable voxels)'.format(
                 os.path.basename(fn[i]), crr_nrej_frame[i], 100. * frac))
@@ -2070,6 +2594,12 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
         chdr['CRRGRZ'] = (crr_grow_z, 'max spectral growth [pix]')
         chdr['CRRGRSIG'] = (crr_grow_nsig, 'growth threshold [sigma]')
         chdr['CRRPADXY'] = (crr_pad_xy, 'unconditional spatial pad [pix]')
+        chdr['CRRZRAT'] = (crr_zratio, 'channels for the per-spaxel scale match')
+        chdr['CRRZSTEP'] = (crr_zstep, 'channels between scale evaluations')
+        chdr['CRRNGRP'] = (crr_ngroup, 'number of crr_split groups')
+        chdr['CRRFSYS'] = (crr_fsys, 'fractional systematic in the noise')
+        chdr['CRRFGRAD'] = (crr_fgrad, 'gradient term in the noise')
+        chdr['CRRGREL'] = (crr_grow_rel, 'relative threshold while growing')
         hdu_c0 = fits.PrimaryHDU(crr_nrej_3d.T, header=chdr)
         tab_c = fits.BinTableHDU(table.Table([[os.path.basename(f) for f in fn], crr_groups,
                                               crr_nrej_frame],
@@ -2125,11 +2655,131 @@ def kcwi_stack(fnlist,shiftlist='',preshiftfn='',fluxfn='',pixscale_x=0.,pixscal
 
 
 
+def _align_boxes(box):
+    """Normalise an alignment box specification to an (n, 4) integer array.
+
+    Accepts the historical [x0, x1, y0, y1], a list of such boxes, or an
+    (n, 4) array. Several boxes let the cross-correlation use more than one
+    source in the field, which matters when no single object is bright enough
+    on its own, when the brightest one is extended or sits on a gradient, or
+    when a cosmic ray or a detector artefact can out-weigh the real source and
+    lock the solution onto a spurious peak.
+
+    Args:
+        box: [x0, x1, y0, y1], or a sequence of them.
+
+    Returns:
+        ndarray [n, 4]: one row per box.
+    """
+    b = np.atleast_2d(np.asarray(box))
+    if b.ndim != 2 or b.shape[1] != 4:
+        raise ValueError('box must be [x0, x1, y0, y1] or a list of them; '
+                         'got shape {}'.format(np.shape(box)))
+    return b.astype(int)
+
+
+def _align_crls(img0, img, boxes, dx, dy, background_subtraction=False,
+                background_level=-1000., scale=1, combine='norm'):
+    """Cross-correlation surface of two thumbnails over one or more boxes.
+
+    Each box gives its own surface from the statistic kcwi_align has always
+    used -- the mean of the product of the two cutouts over the pixels where
+    that product is non-zero -- so with a single box the result is unchanged.
+
+    With several boxes the surfaces are combined. Adding them raw would let the
+    brightest source decide the shift by itself, which is the thing several
+    boxes are meant to avoid, so each surface is first put on a common footing:
+    its median is removed and it is divided by its own robust scatter, which
+    makes the height of a peak a significance rather than a flux. A faint
+    source then counts as much as a bright one, and a box whose peak is
+    ambiguous contributes a flat surface that neither helps nor hurts.
+    combine='sum' keeps the flux weighting instead.
+
+    Args:
+        img0, img (ndarray): reference and current thumbnail, NaNs replaced.
+        boxes (ndarray [n, 4]): [x0, x1, y0, y1] per box, unscaled.
+        dx, dy (ndarray): integer shift grids, same shape as the output.
+        background_subtraction (bool), background_level (float): as in
+            kcwi_align.
+        scale (int): multiply the box coordinates by this -- the upsampling
+            factor in the second pass.
+        combine (str): 'norm' (above), 'median' (the median of the
+            standardised surfaces instead of their mean -- immune to one bad
+            box, needs at least three), or 'sum' (raw, flux-weighted).
+
+    Returns:
+        (ndarray, list of ndarray): the combined surface and the per-box ones.
+    """
+    surfs = []
+    for (bx0, bx1, by0, by1) in boxes:
+        bx0, bx1 = int(bx0) * int(scale), int(bx1) * int(scale)
+        by0, by1 = int(by0) * int(scale), int(by1) * int(scale)
+        cut0 = img0[bx0:bx1, by0:by1]
+        c = np.zeros(dx.shape)
+        for ii in range(c.shape[0]):
+            for jj in range(c.shape[1]):
+                cut = img[bx0 - dx[ii, jj]:bx1 - dx[ii, jj],
+                          by0 - dy[ii, jj]:by1 - dy[ii, jj]]
+                if cut.shape != cut0.shape or cut.size == 0:
+                    continue          # the shifted box ran off the thumbnail
+                cut = cut.copy()
+                cut0_ = cut0.copy()
+                if background_subtraction:
+                    if background_level == -1000:
+                        back_val = np.median(cut)
+                        back_val0 = np.median(cut0_)
+                    else:
+                        back_val = float(background_level)
+                        back_val0 = back_val
+                    cut = cut - back_val
+                    cut0_ = cut0_ - back_val0
+                else:
+                    if background_level != -1000:
+                        cut[cut < background_level] = 0
+                        cut0_[cut0_ < background_level] = 0
+                cut[cut < 0] = 1e-10
+                cut0_[cut0_ < 0] = 1e-10
+                mult = cut0_ * cut
+                n = np.nansum(mult != 0)
+                if n > 0:
+                    c[ii, jj] = np.nansum(mult) / n
+        surfs.append(c)
+
+    if len(surfs) == 1:
+        return surfs[0], surfs
+    if combine == 'sum':
+        return np.sum(surfs, axis=0), surfs
+    # standardise each surface: subtract its median and divide by its own
+    # robust scatter, so a peak's height becomes a significance rather than a
+    # flux and a faint source counts as much as a bright one
+    z = []
+    for c in surfs:
+        f = c[np.isfinite(c) & (c != 0)]
+        if f.size < 4:
+            continue
+        med = np.median(f)
+        sig = 1.4826 * np.median(np.abs(f - med))
+        if not np.isfinite(sig) or sig <= 0:
+            sig = np.std(f)
+        if not np.isfinite(sig) or sig <= 0:
+            continue
+        z.append((c - med) / sig)
+    if len(z) == 0:
+        return np.sum(surfs, axis=0), surfs
+    if combine == 'median' and len(z) >= 3:
+        # one box can still carry a very sharp spurious peak -- a cosmic ray,
+        # an artefact, a neighbour that moved -- and a sum lets its enormous
+        # significance outvote the others. The median across boxes cannot be
+        # moved by one of them, so it is the choice when a box might be bad.
+        return np.median(np.stack(z, axis=0), axis=0), surfs
+    return np.mean(np.stack(z, axis=0), axis=0), surfs
+
+
 def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscale_y=-1.,
     orientation=-1000.,dimension=[-1.,-1.],preshiftfn='',trim=[-1,-1],cubed=False,
     noalign=False,display=True,search_size=-1000,conv_filter=-1000,upfactor=-1000.,
     background_subtraction=False,background_level=-1000.,method='interp',
-    use_regmask=True, npix_trim = 4):
+    use_regmask=True, npix_trim = 4, box_combine='norm'):
 
     """
     Align individual data cubes and correct their relative astrometry using
@@ -2139,8 +2789,14 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
         fnlist (str): file name of the list that contains individual files.
         wavebin ([float, float]): wavelength range for white-light image. Set to
             override par file.
-        box ([float x 4]): location of the alignment box ([x-lower-left,
-            y-lower-left, x-upper-right, y-upper-right]). Override the par file.
+        box ([int x 4] or [[int x 4], ...]): alignment box as
+            [x0, x1, y0, y1] in thumbnail pixels, or a list of such boxes to
+            use several sources at once. Overrides the par file, where one
+            align_box line per box does the same thing. Several boxes help
+            when no single object is bright enough on its own, when the
+            brightest one is extended or sits on a gradient, and when an
+            artefact could otherwise out-weigh the real source; see
+            _align_crls for how the boxes are combined.
         pixscale_x (float): override the parfile pixel size in the x-direction
             in arcsec.
         pixscale_y (float): override the parfile pixel size in the y-direction
@@ -2170,6 +2826,20 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
             masked by Region files.
         npix_trim (int): number of pixels to trim cubes by. Default = 4. May want
             npix_trim = 1 for Large slicer.
+        box_combine (str): how several boxes are combined. 'norm' (default)
+            standardises each box's surface so every source counts equally;
+            'median' takes the median of those instead of the mean, which one
+            bad box cannot move (needs three or more); 'sum' adds the raw
+            surfaces, i.e. flux-weighted. Ignored for a single box.
+            On synthetic fields with three sources, recovering the right
+            integer shift over 60 noise realisations:
+                                     1 box  norm  median  sum
+              faint field, S/N ~ 6      31    42      35   43
+              same + a cosmic ray in
+              the first box              0     8      25    0
+            So 'norm' for an ordinary field and 'median' when a box might be
+            contaminated; 'median' costs a little in the clean case because
+            taking the median of three surfaces throws away signal.
 
 
     Returns:
@@ -2195,11 +2865,16 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
     if wavebin[0]==-1:
         wavebin=par['wavebin']
 
-    # define alignment box
-    if box[0]==-1:
-        box=par['align_box']
-        if box[0]==-1:
-            box=[25,50,25,40]
+    # define alignment box(es)
+    if np.ndim(box) == 1 and box[0] == -1:
+        box = par['align_box']
+        if np.ndim(box) == 1 and box[0] == -1:
+            box = [25, 50, 25, 40]
+    boxes = _align_boxes(box)
+    if len(boxes) > 1:
+        print('Alignment: {} boxes, combined with \'{}\''.format(len(boxes), box_combine))
+        for ib, bb in enumerate(boxes):
+            print('   box {}: x {}-{}, y {}-{}'.format(ib, bb[0], bb[1], bb[2], bb[3]))
 
     # size of pixels post projection
     if pixscale_x==-1:
@@ -2465,31 +3140,10 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                 dy,dx=np.meshgrid(yy,xx)
                 dx=dx.astype(int)
                 dy=dy.astype(int)
-                crls=np.zeros(dx.shape)
-                for ii in range(crls.shape[0]):
-                    for jj in range(crls.shape[1]):
-                        cut0=img0[box[0]:box[1],box[2]:box[3]]
-                        cut=img[box[0]-dx[ii,jj]:box[1]-dx[ii,jj],box[2]-dy[ii,jj]:box[3]-dy[ii,jj]]
-                        #print(cut)
-                        #print(box[0]-dx[ii,jj],box[1]-dx[ii,jj],box[2]-dy[ii,jj],box[3]-dy[ii,jj])
-                        if background_subtraction:
-                            if background_level==-1000:
-                                back_val=np.median(cut)
-                                back_val0=np.median(cut0)
-                            else:
-                                back_val=float(background_level)
-                                back_val0=back_val
-                            cut=cut-back_val
-                            cut0=cut0-back_val0
-                        else:
-                            if background_level!=-1000:
-                                cut[cut<background_level]=0
-                                cut0[cut0<background_level]=0
-                        cut[cut<0]=1e-10
-                        cut0[cut0<0]=1e-10
-                        mult=cut0*cut
-                        if np.nansum(mult!=0)>0:
-                            crls[ii,jj]=np.nansum(mult)/np.nansum(mult!=0)
+                crls, crls_box = _align_crls(
+                    img0, img, boxes, dx, dy,
+                    background_subtraction=background_subtraction,
+                    background_level=background_level, combine=box_combine)
 
                 from astropy.visualization import ImageNormalize, ZScaleInterval, LinearStretch, AsinhStretch
 
@@ -2581,28 +3235,11 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                 dy,dx=np.meshgrid(yy,xx)
                 dx=dx.astype(int)
                 dy=dy.astype(int)
-                crls=np.zeros(dx.shape)
-                for ii in range(crls.shape[0]):
-                    for jj in range(crls.shape[1]):
-                        cut0=img0[box[0]*upfactor:box[1]*upfactor,box[2]*upfactor:box[3]*upfactor]
-                        cut=img[box[0]*upfactor-dx[ii,jj]:box[1]*upfactor-dx[ii,jj],box[2]*upfactor-dy[ii,jj]:box[3]*upfactor-dy[ii,jj]]
-                        if background_subtraction:
-                            if background_level==-1000:
-                                back_val=np.median(cut)
-                                back_val0=np.median(cut0)
-                            else:
-                                back_val=float(background_level)
-                                back_val0=back_val
-                            cut0=cut0-back_val0
-                            cut=cut-back_val
-                        else:
-                            if background_level!=-1000:
-                                cut[cut<background_level]=0
-                                cut0[cut0<background_level]=0
-                        cut[cut<0]=1e-10
-                        cut0[cut0<0]=1e-10
-                        mult=cut0*cut
-                        crls[ii,jj]=np.sum(mult)/np.sum(mult!=0)
+                crls, crls_box = _align_crls(
+                    img0, img, boxes, dx, dy,
+                    background_subtraction=background_subtraction,
+                    background_level=background_level, scale=upfactor,
+                    combine=box_combine)
 
                 #plt.figure(1)
                 #plt.clf()
@@ -2619,7 +3256,8 @@ def kcwi_align(fnlist,wavebin=[-1.,-1.],box=[-1,-1,-1,-1],pixscale_x=-1.,pixscal
                 xshift[i]+=xx[tmp[0]]/upfactor
                 yshift[i]+=yy[tmp[1]]/upfactor
                 ax.plot(xshift[i],yshift[i],'+',color='r')
-                plt.title(os.path.basename(fn[i]))
+                plt.title('{}{}'.format(os.path.basename(fn[i]),
+                          '' if len(boxes)==1 else '  ({} boxes)'.format(len(boxes))))
 
 
                 # get pixel shift

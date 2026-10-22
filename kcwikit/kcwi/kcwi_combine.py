@@ -209,8 +209,47 @@ def _resample_block(st, yi, xi, z0, z1, shape_out):
     return i_out, v_out, e_out
 
 
+def _crr_zsmooth(a, size, step=1):
+    """Running median along wavelength, evaluated every `step` channels.
+
+    Used for the per-spaxel scale between two cubes, which is smooth along
+    wavelength by construction, so there is no point evaluating it at every
+    channel: scipy's median_filter costs O(size) per output voxel and is ~80%
+    of the cosmic-ray rejection's run time on a long stack. Evaluating it on a
+    decimated grid and interpolating is about eight times faster and agrees to
+    ~1%, which then largely cancels in the ratio of two such medians.
+
+    Args:
+        a (ndarray): [nz, ny, nx].
+        size (int): width of the running median [channels].
+        step (int): evaluate every this many channels; 1 reproduces
+            ndimage.median_filter(a, (size, 1, 1), mode='nearest') exactly.
+
+    Returns:
+        ndarray: same shape as `a`.
+    """
+    nz = a.shape[0]
+    step = max(int(step), 1)
+    if step == 1 or nz < 2 * step:
+        return ndimage.median_filter(a, size=(int(size), 1, 1), mode='nearest')
+    h = int(size) // 2
+    zc = np.arange(0, nz, step)
+    if zc[-1] != nz - 1:
+        zc = np.append(zc, nz - 1)
+    sm = np.empty((len(zc),) + a.shape[1:], dtype=a.dtype)
+    for i, z in enumerate(zc):
+        sm[i] = np.median(a[max(z - h, 0):min(z + h + 1, nz)], axis=0)
+    w = np.interp(np.arange(nz), zc, np.arange(len(zc)))
+    lo = np.floor(w).astype(int)
+    hi = np.minimum(lo + 1, len(zc) - 1)
+    fr = (w - lo).reshape((-1,) + (1,) * (a.ndim - 1))
+    return sm[lo] * (1 - fr) + sm[hi] * fr
+
+
 def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
-                   grow_xy=2, grow_z=2, grow_nsig=2., pad_xy=0, loo=None):
+                   grow_xy=2, grow_z=2, grow_nsig=2., pad_xy=0, loo=None,
+                   zratio=51, zstep=8, fsys=0.05, fgrad=0.5, grow_rel=0.25,
+                   smax=5.):
     """
     Flag positive outliers (cosmic rays) in each of N aligned cubes by comparing
     each cube with the other ones on the same grid.
@@ -245,8 +284,54 @@ def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
     estimate (one outlier does not move it), computed once instead of once per
     cube; with fewer, the median of the others is used. `loo` overrides that.
 
+
+    Three guards keep a bright quasar from being clipped, where frame-to-frame
+    seeing and transparency differences are large in absolute terms:
+      - `zratio`: each cube is scaled to the comparison estimate per spaxel,
+        smoothly along wavelength, before the difference is taken;
+      - `fgrad`: a term proportional to the spatial gradient is added to the
+        noise, so that a sub-pixel registration error is not significant on
+        the steep flanks of a point source;
+      - `fsys`: a fractional term is added as well, but see below -- at the
+        default thresholds it never binds;
+      - `grow_rel`: the relative test is applied while growing too.
+    Set zratio=0, fsys=0, fgrad=0, grow_rel=0 for the previous behaviour.
+
     Args:
         I, V (ndarray [N, nz, ny, nx]): intensity and variance on a common grid.
+        zratio (int): channels over which the per-spaxel scale between a cube
+            and the comparison estimate is measured; 0 disables the matching.
+        zstep (int): channels between evaluations of that scale, which is
+            smooth along wavelength. 1 evaluates it everywhere and is the
+            slowest part of this function; 8 is ~8x faster, agrees to ~1% and
+            largely cancels in the ratio.
+        fsys (float): fractional systematic added in quadrature to the noise.
+            Inert at the default thresholds, and deliberately kept anyway.
+            Because L is the local MAXIMUM of |scale*est|, L >= |scale*est|
+            always, so the part of the absolute test this term controls,
+                D > nsig * fsys * |scale*est|,
+            is weaker than the relative test D > rel * L whenever
+                nsig * fsys <= rel,
+            which at the defaults is 5 * 0.05 = 0.25 against 0.5. Measured on
+            a synthetic bright quasar it exceeded the relative threshold in
+            0.000% of the bright voxels (median ratio 0.199, maximum 0.500,
+            the bound). The relative test is itself a fractional floor, ten
+            times stronger, so this one does nothing while rel is at 0.5.
+            It matters when you LOWER rel: rel = 0.5 means a cosmic ray on
+            the core of a quasar has to exceed half the quasar to be caught,
+            so if you want those you reduce rel, and fsys is then the only
+            brightness-aware guard left. Raising fsys above rel / nsig makes
+            it active; do not do that without re-checking that real cosmic
+            rays are still found.
+        fgrad (float): the same for the spatial gradient of the estimate,
+            which is what a sub-pixel registration error turns into: a frame
+            offset by d pixels differs by about d * |grad I|, so fgrad is that
+            offset in pixels. Unlike fsys this is not bounded by L -- on a
+            steep flank the per-pixel gradient is a large fraction of the peak
+            -- so it does bind, in about 28% of bright voxels, and removes
+            roughly a quarter of the remaining false positives.
+        grow_rel (float): relative threshold used while growing.
+        smax (float): the per-spaxel scale is clipped to [1/smax, smax].
         good (bool ndarray [N, nz, ny, nx]): valid voxels.
 
     Returns:
@@ -262,6 +347,7 @@ def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
     s_z[:, 1, 1] = True                               # along wavelength only
     if loo is None:
         loo = (N < 5)
+    Esm_all = None
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         if not loo:
@@ -270,9 +356,6 @@ def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
             est_all = np.nanmedian(Ig, axis=0)
             var_all = (np.where(n_all >= 3, np.pi / 2., 1.) *
                        np.nanmean(Vg, axis=0) / np.maximum(n_all, 1))
-            L_all = ndimage.maximum_filter(np.nan_to_num(np.abs(est_all)),
-                                           size=(int(zwindow), int(window), int(window)),
-                                           mode='nearest')
         for k in range(N):
             if not loo:
                 est, var_est, n_oth = est_all, var_all, n_all - good[k]
@@ -287,18 +370,64 @@ def _flag_outliers(I, V, good, nsig=5., rel=0.5, window=5, zwindow=3, zmed=15,
                     corr = np.where(n_oth >= 3, np.pi / 2., 1.)
                     var_est = corr * np.nanmean(Vg[oth], axis=0) / np.maximum(n_oth, 1)
             testable = good[k] & (n_oth > 0) & np.isfinite(est) & np.isfinite(var_est)
-            sig = np.sqrt(np.where(testable, V[k] + var_est, np.inf))
-            D = np.where(testable, I[k] - est, 0.)
+            e0 = np.nan_to_num(est)
+            # Scale match before differencing. Seeing and transparency make one
+            # frame a smoothly wavelength-dependent multiple of the others at
+            # every spaxel, and high-passing that DIFFERENCE turns every narrow
+            # spectral feature into a positive spike: where an absorption line
+            # cuts the flux, the deficit of a fainter frame shrinks, and the
+            # running median leaves a cosmic-ray-shaped residual. Dividing the
+            # mismatch out first removes it at the source. The scale is the
+            # ratio of the two cubes smoothed over zratio channels (and 3x3
+            # spatially, so the faint halo is matched too), which cosmic rays,
+            # being a few channels wide, cannot move.
+            if zratio and zratio > 1:
+                nsm = int(zratio) * 9
+                Ism = ndimage.uniform_filter(
+                    _crr_zsmooth(np.nan_to_num(Ig[k]), zratio, zstep),
+                    size=(1, 3, 3), mode='nearest')
+                if loo:
+                    Esm = ndimage.uniform_filter(
+                        _crr_zsmooth(e0, zratio, zstep), size=(1, 3, 3), mode='nearest')
+                else:
+                    # est is the same cube for every k, so smooth it once
+                    if Esm_all is None:
+                        Esm_all = ndimage.uniform_filter(
+                            _crr_zsmooth(e0, zratio, zstep), size=(1, 3, 3), mode='nearest')
+                    Esm = Esm_all
+                ok_s = Esm > 3. * np.sqrt(np.nan_to_num(var_est) / nsm)
+                scale = np.where(ok_s & (Esm != 0), Ism / np.where(Esm == 0, 1., Esm), 1.)
+                scale = np.clip(np.nan_to_num(scale, nan=1.), 1. / smax, smax)
+            else:
+                scale = np.ones_like(e0)
+            se = scale * e0
+            D = np.where(testable, I[k] - se, 0.)
             if zmed and zmed > 1:
                 D = D - ndimage.median_filter(D, size=(int(zmed), 1, 1), mode='nearest')
-            if loo:
-                L = ndimage.maximum_filter(np.nan_to_num(np.abs(est)),
-                                           size=(int(zwindow), int(window), int(window)), mode='nearest')
-            else:
-                L = L_all
+            # Noise budget. The photon term alone scales as sqrt(I), so on a
+            # bright quasar any residual percent-level mismatch is formally
+            # significant; fgrad and fsys add the systematic floor the
+            # frame-to-frame scatter actually has. fgrad is the one that does
+            # the work -- fsys is dominated by the relative test below unless
+            # nsig * fsys > rel, see the docstring.
+            var = V[k] + scale ** 2 * np.nan_to_num(var_est)
+            if fsys:
+                var = var + (fsys * np.abs(se)) ** 2
+            if fgrad:
+                var = var + (fgrad * np.maximum(np.abs(np.gradient(se, axis=1)),
+                                                np.abs(np.gradient(se, axis=2)))) ** 2
+            sig = np.sqrt(np.where(testable, var, np.inf))
+            L = ndimage.maximum_filter(np.abs(se),
+                                       size=(int(zwindow), int(window), int(window)),
+                                       mode='nearest')
             f = testable & (D > nsig * sig) & (D > rel * L)
             if f.any():
                 cand = testable & (D > grow_nsig * sig)
+                if grow_rel:
+                    # the relative test has to hold while growing as well, or a
+                    # cosmic ray beside a bright source grows into it, where a
+                    # 2-sigma condition is met by the mismatch alone
+                    cand &= (D > grow_rel * L)
                 for _ in range(int(grow_z)):
                     new = ndimage.binary_dilation(f, structure=s_z) & cand & ~f
                     if not new.any():
@@ -325,6 +454,8 @@ def kcwi_combine_stacks(cubefns, outname, wavebin=None, box=None, search_size=10
                         min_overlap=0.3, nsig_flux=3., crr=False, crr_nsig=5.,
                         crr_rel=0.5, crr_window=5, crr_zwindow=3, crr_zmed=15,
                         crr_grow_xy=2, crr_grow_z=2, crr_grow_nsig=2., crr_pad_xy=0,
+                        crr_zratio=51, crr_zstep=8, crr_fsys=0.05, crr_fgrad=0.5,
+                        crr_grow_rel=0.25,
                         zblock=200, display=True, overwrite=True):
     """
     Align and co-add stacked KCWI cubes (outputs of kcwi_stack).
@@ -388,7 +519,14 @@ def kcwi_combine_stacks(cubefns, outname, wavebin=None, box=None, search_size=10
         crr_grow_nsig (float): threshold for growing.
         crr_pad_xy (int): unconditional spatial margin (pixels) added around the
             final mask, for the low-level wings spread by resampling. 0 = off.
-        zblock (int): number of wavelength slices processed at a time (memory).
+        zblock (int): number of wavelength channels processed at a time
+            (memory). Each block also reads `pad` channels on either side,
+            pad = max(crr_zwindow, crr_zmed, crr_zratio)//2 + crr_grow_z + 1,
+            i.e. 28 with the defaults, so a small block spends much of its
+            time on overlap: 200 wastes 28%, 600 wastes 9%.
+        crr_zstep (int): channels between evaluations of the per-spaxel scale,
+            which is smooth along wavelength; 8 is ~8x faster than 1 and gives
+            the same flags.
         display (bool): show the diagnostic plots (they are always saved).
         overwrite (bool): overwrite the outputs.
 
@@ -600,7 +738,12 @@ def kcwi_combine_stacks(cubefns, outname, wavebin=None, box=None, search_size=10
     crmask = np.zeros((nz,) + shape_out, dtype=np.int16) if crr else None
     nrej = np.zeros(N, dtype=np.int64)
     ntest = np.zeros(N, dtype=np.int64)
-    pad = (max(int(crr_zwindow), int(crr_zmed)) // 2 + int(crr_grow_z) + 1) if crr else 0
+    # margin for the widest wavelength filter, which is the zratio scale
+    # window. The truncation at a block edge mostly cancels in the ratio, so
+    # this changes very few flags, but it makes the blocked result match the
+    # unblocked one exactly -- see the note in kcwi.kcwi_stack.
+    pad = (max(int(crr_zwindow), int(crr_zmed), int(crr_zratio)) // 2
+           + int(crr_grow_z) + 1) if crr else 0
 
     print('Resampling and co-adding{}...'.format(' with outlier rejection' if crr else ''))
     for z0 in range(0, nz, zblock):
@@ -618,7 +761,9 @@ def kcwi_combine_stacks(cubefns, outname, wavebin=None, box=None, search_size=10
         if crr:
             fl = _flag_outliers(I, V, good, nsig=crr_nsig, rel=crr_rel, window=crr_window,
                                 zwindow=crr_zwindow, zmed=crr_zmed, grow_xy=crr_grow_xy,
-                                grow_z=crr_grow_z, grow_nsig=crr_grow_nsig, pad_xy=crr_pad_xy)
+                                grow_z=crr_grow_z, grow_nsig=crr_grow_nsig, pad_xy=crr_pad_xy,
+                                zratio=crr_zratio, zstep=crr_zstep, fsys=crr_fsys,
+                                fgrad=crr_fgrad, grow_rel=crr_grow_rel)
             c = slice(z0 - p0, z0 - p0 + (z1 - z0))
             fl_c = fl[:, c]
             nrej += fl_c.reshape(N, -1).sum(axis=1)
